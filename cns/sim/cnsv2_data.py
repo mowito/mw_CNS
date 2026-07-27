@@ -68,8 +68,11 @@ def load_bproc_samples(scene_dir, policy=Policy.PBVS_Straight, intrinsic=None):
             Ics.append(imgs[i]); Ids.append(Id_img); vsis.append(vsi); tpos.append(tpo)
 
     def imgs_t(lst):
+        # Keep UINT8. As float32 this is 3.1MB/image: at 800 scenes (~4000 pairs)
+        # Ic+Id alone would be ~25GB and the cache build OOMs a 31GB box.
+        # precompute_backbone_features() scales to [0,1] per chunk on the GPU.
         arr = np.stack(lst)
-        return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().float() / 255.0
+        return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
 
     return {
         "Ic": imgs_t(Ics), "Id": imgs_t(Ids),
@@ -85,6 +88,10 @@ def precompute_backbone_features(net, images, device, batch=8, store_dtype=torch
     net.eval()
     for i in range(0, images.shape[0], batch):
         chunk = images[i:i + batch].to(device)
+        # load_bproc_samples() hands us uint8 to keep host RAM bounded; the
+        # PyBullet path (generate_samples) already yields floats in [0,1].
+        if chunk.dtype == torch.uint8:
+            chunk = chunk.float().div_(255.0)
         f = net.backbone(chunk)
         feats.append(f.to(store_dtype).cpu())
     return torch.cat(feats, dim=0)

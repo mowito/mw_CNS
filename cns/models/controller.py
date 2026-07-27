@@ -65,8 +65,16 @@ class NeuralController(nn.Module):
                  n_self: int = 3, heads: int = 8, regress_norm: bool = True):
         super().__init__()
         self.regress_norm = regress_norm
-        # project coarse current features and the probability grid into token space
+        # project coarse current features and the probability grid into token space.
+        # P is a distribution over grid_dim=K*K cells, so its entries sit at ~1/K^2
+        # (~4e-3) while the refined ViT features are LayerNorm'd to std~1. Feeding P
+        # in raw makes its contribution ~1e-3 of the feature contribution -- swamped
+        # by grid_proj's own bias -- so the controller ignores the correspondence
+        # signal entirely and can only regress the mean velocity. Normalize the grid
+        # to feature scale first; this keeps the *pattern* (which cells are likely)
+        # and only discards the meaningless absolute magnitude.
         self.feat_proj = nn.Linear(feat_dim, dim)
+        self.grid_norm = nn.LayerNorm(grid_dim)
         self.grid_proj = nn.Linear(grid_dim, dim)
         self.fuse = nn.Linear(2 * dim, dim)
         self.self_blocks = nn.ModuleList([_SelfBlock(dim, heads) for _ in range(n_self)])
@@ -83,7 +91,7 @@ class NeuralController(nn.Module):
         Returns (vec [B,6], log_norm [B,1] or None, hidden(passthrough))."""
         B, H, W, _ = Fc.shape
         tf = self.feat_proj(Fc.reshape(B, H * W, -1))
-        tg = self.grid_proj(P.reshape(B, H * W, -1))
+        tg = self.grid_proj(self.grid_norm(P.reshape(B, H * W, -1)))
         tok = self.fuse(torch.cat([tf, tg], dim=-1))       # [B,N,dim]
         for blk in self.self_blocks:
             tok = blk(tok)
