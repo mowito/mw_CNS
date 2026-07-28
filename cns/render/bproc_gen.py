@@ -14,8 +14,12 @@ import blenderproc as bproc   # MUST be the very first statement (rewrites inter
 #
 # Objects: GSO/.obj meshes from --meshes if given, else Blender primitives with
 # randomized PBR materials as stand-ins (swap in GSO once downloaded).
-import argparse, os, glob
+import argparse, os, glob, sys
 import numpy as np
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from cns.sim.pose_perturb import perturb_pose
+from cns.sim.pose_sampling import sample_desired, sample_initial
 
 
 def look_at_cv(eye, center, up=(0, 0, 1)):
@@ -71,6 +75,13 @@ def main():
     ap.add_argument("--meshes", default=None, help="dir of GSO .obj meshes (optional)")
     ap.add_argument("--hdri", default="data/hdri")
     ap.add_argument("--seed", type=int, default=0)
+    # Fraction of CURRENT poses drawn as near-goal perturbations of the desired
+    # pose instead of independent hemisphere samples. Independent sampling alone
+    # leaves only ~5% of pairs with ||vel_si||<0.5, and the policy is at chance
+    # (translation cosine 0.51) in exactly that regime, so the closed loop stalls
+    # or diverges near the goal. See cns/sim/pose_perturb.py.
+    ap.add_argument("--near-frac", type=float, default=0.0,
+                    help="0..1 fraction of current poses perturbed from the desired pose")
     # BlenderProc strips the "--" separator; our flags sit among Blender's own
     # argv, so pick them out with parse_known_args over the whole argv.
     argv = __import__("sys").argv
@@ -113,15 +124,29 @@ def main():
 
         # desired pose (frame 0) + current poses (frames 1..M)
         poses_cv = []
-        def sample_pose():
-            fill = rng.uniform(0.45, 0.75)               # target frame-fill fraction
-            r = float(np.clip(2.0 * scene_radius / fill, 0.35, 3.0))
-            th = rng.uniform(0, 6.28); ph = rng.uniform(np.radians(20), np.radians(75))
-            eye = scene_center + r * np.array(
-                [np.cos(ph) * np.cos(th), np.cos(ph) * np.sin(th), np.sin(ph)])
-            return look_at_cv(eye, scene_center + rng.uniform(-0.05, 0.05, 3))
-        for _ in range(args.currents + 1):
-            wcT = sample_pose(); poses_cv.append(wcT)
+        # CNS-v1-faithful sampling (cns/sim/pose_sampling.py). The previous
+        # sampler was wrong in three ways: symmetric elevation 20-75 deg for both
+        # poses (CNS v1: desired 70-90, initial 30-90 -- the asymmetry IS the
+        # task), NO in-plane roll at all (CNS v1: initial up to 60 deg, and the
+        # paper cites large initial in-plane rotation as where rivals fail), and
+        # scene-relative distance 0.35-3.0m (CNS v1: absolute r 0.5-0.9m).
+        def sample_pose_desired():
+            return sample_desired(rng, scene_center)
+
+        def sample_pose_initial():
+            return sample_initial(rng, scene_center)
+        # view 0 = desired; views 1..M = currents. A --near-frac share of the
+        # currents are perturbations of the desired pose so the near-goal regime
+        # the closed loop must land in is actually represented.
+        desired = sample_pose_desired()
+        poses_cv.append(desired)
+        bproc.camera.add_camera_pose(desired @ _CV2GL)
+        for j in range(args.currents):
+            if rng.uniform() < args.near_frac:
+                wcT, _te, _re = perturb_pose(desired, rng)
+            else:
+                wcT = sample_pose_initial()
+            poses_cv.append(wcT)
             bproc.camera.add_camera_pose(wcT @ _CV2GL)
 
         data = bproc.renderer.render()

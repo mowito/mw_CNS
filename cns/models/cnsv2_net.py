@@ -68,8 +68,8 @@ class CNSv2Net(nn.Module):
         return NeuralController.postprocess(raw_pred, tPo_norm)
 
     @staticmethod
-    def objectives(raw_pred, vel_si):
-        return NeuralController.objectives(raw_pred, vel_si)
+    def objectives(raw_pred, vel_si, norm_weight: float = 1.0):
+        return NeuralController.objectives(raw_pred, vel_si, norm_weight)
 
     def get_parameter_groups(self):
         """Only trainable params (frozen backbone excluded via requires_grad)."""

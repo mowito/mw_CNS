@@ -118,7 +118,7 @@ class NeuralController(nn.Module):
         return v
 
     @staticmethod
-    def objectives(raw_pred, vel_si):
+    def objectives(raw_pred, vel_si, norm_weight: float = 1.0):
         """CNSv2 losses (Eq. 23). vel_si: [B,6] GT normalized velocity.
         L_norm = |sigma^-1(||v*||) - l~| (L1);  L_dir = 1 - cos(v*, v~_dir)."""
         vec, log_norm, _ = raw_pred
@@ -132,7 +132,12 @@ class NeuralController(nn.Module):
             l_norm = (sigma_inv(gt_norm) - log_norm.squeeze(-1)).abs().mean()
         else:
             l_norm = (vec.norm(dim=-1) - gt_norm).abs().mean()
-        loss = l_dir + l_norm
+        # Eq.23 sums the two terms unweighted, which is fine when they are the
+        # same order. With near-goal data they are not: sigma_inv(y)=1+log(y)
+        # reaches -3.9 for y~0.007, so l_norm runs ~1.09 against l_dir ~0.69 and
+        # supplies ~60% of the gradient. Direction is what drives servo
+        # convergence, so allow the magnitude term to be down-weighted.
+        loss = l_dir + norm_weight * l_norm
         result = {"loss": float(loss.detach()), "l_dir": float(l_dir.detach()),
                   "l_norm": float(l_norm.detach())}
         return result, loss

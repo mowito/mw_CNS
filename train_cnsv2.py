@@ -36,6 +36,22 @@ def main():
     ap.add_argument("--out", default="checkpoints/cnsv2.pth")
     ap.add_argument("--log-every", type=int, default=200)
     ap.add_argument("--save-every", type=int, default=5000)
+    # Down-weight the magnitude term in `l_dir + w*l_norm`. Needed once near-goal
+    # data is present: sigma_inv targets reach -3.9, so l_norm runs ~1.09 against
+    # l_dir ~0.69 -- ~60% of the gradient goes to magnitude while direction, which
+    # is what actually drives servo convergence, stalls.
+    ap.add_argument("--norm-weight", type=float, default=1.0)
+    # Drop samples whose pose error is below the correspondence grid's spatial
+    # resolution. Patches are 512/32 = 16px, so ||vel_si||~0.03 is ~0.5 patch of
+    # image displacement: measured paired cos(Fc,Fd) = 0.93 there, i.e. the two
+    # views are nearly identical in feature space and the label is unlearnable.
+    # Worse, sigma_inv(0.007) = -4.15 vs a median target of 1.49, so those 11% of
+    # samples contributed 32% of the L1 magnitude loss -- an unfittable term that
+    # dominated the gradient and stalled direction learning entirely
+    # (16k-iter run: l_dir flat at 0.69 for 44 validations, l_norm stuck ~1.05).
+    # 0.05 keeps the USEFUL near-goal band (~1.2-6 patches) and drops the rest.
+    ap.add_argument("--min-vel", type=float, default=0.0,
+                    help="drop samples with ||vel_si|| below this (sub-patch, unlearnable)")
     # This head overfits 1850 pairs by ~iter 1000 (val l_dir bottoms at 0.596 then
     # climbs back above the best-constant baseline by iter 2000 while train keeps
     # falling). Without best-tracking the FINAL checkpoint is the worst one, so
@@ -55,7 +71,18 @@ def main():
     import glob as _g
     n_scenes = len(_g.glob(os.path.join(args.data, "scene_*.npz")))
     if os.path.exists(cache):
-        blob = torch.load(cache, map_location="cpu")
+        # mmap the feature cache instead of reading it into RAM. At 1400 scenes it
+        # is 18.8GB (Fc+Fd, fp16) and a plain load OOM-killed training on this
+        # 31GB box (exit 137) -- the process held 18.8GB anonymous while 18.8GB of
+        # dirty pages from having just written the file were still flushing.
+        # Training only ever indexes 8 rows at a time, so demand-paging is a
+        # strictly better fit than resident tensors.
+        try:
+            blob = torch.load(cache, map_location="cpu", mmap=True)
+        except (TypeError, RuntimeError) as e:
+            print(f"[feat] mmap load unavailable ({type(e).__name__}), "
+                  f"falling back to full read", flush=True)
+            blob = torch.load(cache, map_location="cpu")
         Fc, Fd, vsi, tr, va = blob["Fc"], blob["Fd"], blob["vsi"], blob["tr"], blob["va"]
         # The cache used to be trusted on existence alone, so rendering MORE scenes
         # into --data and relaunching would silently keep training on the old
@@ -91,6 +118,16 @@ def main():
         import gc; gc.collect()
         print(f"[feat] cached -> {cache}", flush=True)
 
+    if args.min_vel > 0:
+        keep = (vsi.norm(dim=-1) >= args.min_vel)
+        n_tr0, n_va0 = len(tr), len(va)
+        tr, va = tr[keep[tr]], va[keep[va]]
+        print(f"[filter] --min-vel {args.min_vel}: train {n_tr0}->{len(tr)} "
+              f"({100*(1-len(tr)/n_tr0):.1f}% dropped), val {n_va0}->{len(va)}", flush=True)
+        nn = vsi[tr].norm(dim=-1)
+        print(f"[filter] remaining ||vel_si||: min {nn.min():.4f} median {nn.median():.3f}; "
+              f"near-goal(<0.5) now {100*(nn < 0.5).float().mean():.1f}% of train", flush=True)
+
     decay, no_decay = net.get_parameter_groups()
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": 1e-2},
                              {"params": no_decay, "weight_decay": 0.0}], lr=args.lr)
@@ -123,7 +160,7 @@ def main():
         acc, seen = {}, 0
         for i in range(0, len(va), args.val_batch):
             chunk = va[i:i + args.val_batch]
-            res, _ = net.objectives(batch_forward(chunk), vsi[chunk].to(dev))
+            res, _ = net.objectives(batch_forward(chunk), vsi[chunk].to(dev), args.norm_weight)
             for k, v in res.items():
                 acc[k] = acc.get(k, 0.0) + v * len(chunk)
             seen += len(chunk)
@@ -133,18 +170,26 @@ def main():
     def save_to(path):
         torch.save({"state_dict": net.state_dict(), "config": CONFIG,
                     "opt": opt.state_dict(), "sched": sched.state_dict(),
-                    "iters_done": it + 1}, path)
+                    "iters_done": it + 1,
+                    "best_l_dir": best["l_dir"], "best_it": best["it"]}, path)
 
     best_path = args.out.replace(".pth", "_best.pth")
     best = {"l_dir": float("inf"), "it": -1}
     stale = 0
+    # Carry the best-so-far across a resume. Without this, a resumed run starts at
+    # inf and its FIRST validation always looks like an improvement, overwriting
+    # cnsv2_best.pth with a worse model and silently losing the real optimum.
+    if cks and "best_l_dir" in ck:
+        best["l_dir"] = float(ck["best_l_dir"]); best["it"] = int(ck.get("best_it", -1))
+        print(f"[resume] carrying best val l_dir {best['l_dir']:.4f} @ iter {best['it']}",
+              flush=True)
     print(f"[train] {args.iters} iters (from {start_it}), batch {args.batch}, fp32", flush=True)
     net.train(); t0 = time.time(); hist = []
     for it in range(start_it, args.iters):
         idx = tr[torch.randint(0, len(tr), (args.batch,))]
         opt.zero_grad(set_to_none=True)
         raw = batch_forward(idx)
-        _, loss = net.objectives(raw, vsi[idx].to(dev))
+        _, loss = net.objectives(raw, vsi[idx].to(dev), args.norm_weight)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
         opt.step(); sched.step()

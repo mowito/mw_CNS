@@ -129,6 +129,46 @@ class ProbMatch(nn.Module):
             logits = torch.matmul(fc, fd.transpose(1, 2)) / (C ** 0.5)
             return torch.softmax(logits, dim=-1)
 
+    def dual_softmax_conf(self, Fc: torch.Tensor, Fd: torch.Tensor) -> torch.Tensor:
+        """Eq. 25 confidence C^i = sum_j S^{i,j}_{c->d} * S^{i,j}_{d->c}.  -> [B,N]
+
+        score_matrix() only returns S_{c->d} (softmax over the desired axis), so
+        the reverse direction is the softmax of the SAME logits over the current
+        axis. Recomputed here in fp32 for the same overflow reason.
+        """
+        B, H, W, C = Fc.shape
+        with torch.autocast(device_type=Fc.device.type, enabled=False):
+            fc = Fc.reshape(B, H * W, C).float()
+            fd = Fd.reshape(B, H * W, C).float()
+            logits = torch.matmul(fc, fd.transpose(1, 2)) / (C ** 0.5)
+            s_c2d = torch.softmax(logits, dim=-1)      # over desired patches j
+            s_d2c = torch.softmax(logits, dim=-2)      # over current patches i
+            return (s_c2d * s_d2c).sum(-1)             # [B,N]
+
+    def gravity_centers(self, Fc: torch.Tensor, Fd: torch.Tensor):
+        """Eq. 25 image gravity centres, in PATCH coordinate units.
+
+            cX_g = sum_i C^i x^i_c / sum_i C^i
+            dX_g = sum_i C^i (x^i_c + F^i) / sum_i C^i
+
+        where x^i_c + F^i is patch i's matched location in the desired image,
+        i.e. exactly explicit_corr(). Used by the hybrid (2.5D) velocity control
+        of paper section G, and for its switch-to-PBVS test
+        ||cX_g - dX_g|| > 0.1*sqrt(N16).
+
+        Returns (cXg [B,2], dXg [B,2], conf [B,N]).
+        """
+        B, H, W, _ = Fc.shape
+        S = self.score_matrix(Fc, Fd)
+        conf = self.dual_softmax_conf(Fc, Fd)                     # [B,N]
+        grid = patch_grid_coords(H, W, Fc.device).float()          # [N,2]
+        matched = torch.matmul(S, grid)                            # [B,N,2] = x_c + F
+        w = conf.unsqueeze(-1)                                     # [B,N,1]
+        den = w.sum(1).clamp_min(self.eps if hasattr(self, "eps") else 1e-6)
+        cXg = (w * grid.unsqueeze(0)).sum(1) / den
+        dXg = (w * matched).sum(1) / den
+        return cXg, dXg, conf
+
     def explicit_corr(self, S: torch.Tensor, H16: int, W16: int) -> torch.Tensor:
         """Eq. 15 (DEBUG/vis only, not fed to controller). -> [B,N,2]."""
         grid = patch_grid_coords(H16, W16, S.device)      # [N,2]
