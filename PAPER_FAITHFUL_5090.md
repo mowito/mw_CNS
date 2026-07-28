@@ -108,7 +108,7 @@ textures/materials, ambient light.
 | 2 | **DAgger as phase-2** (`collect_dagger.py`: roll out with a frozen ckpt, save, retrain) | **Concurrent** process + periodic weight sync (§6 of plan doc, Fig. 3). On 8 GB VRAM Blender (6.1 GB) + training (7 GB) cannot coexist, so the 4060 plan was *time-slicing*. With 32 GB, run it properly. |
 | 3 | **batch 8** | **batch 16** |
 | 4 | **fp32 training** | Paper uses mixed precision. Note: fp16 overflows the feature correlation → NaN, so `score_matrix` and particle-to-grid are **forced fp32** in `prob_match.py`; keep those islands fp32 under AMP. |
-| 5 | **400→2919 GSO models, 5→155 HDRIs, no background textures** | 6852 models, 733 HDRIs, 32k background textures |
+| 5 | **944 GSO models, 155 HDRIs, ZERO background textures** | 6852 models, 733 HDRIs, 32k background textures |
 | 6 | **Hybrid Jacobian reconstructed** from standard VS blocks in `cns/models/hybrid_control.py` (Eq. 25 + switch threshold ARE exact) | Transcribe from [13] Malis 1999; cross-check vs **ViSP `vpServo`/`vpAdaptiveGain`** (built at `mw_ws/install/VISP` on the laptop) — the plan doc explicitly warns not to trust a from-scratch PBVS without a second source |
 | 7 | **dt = 0.10 s** for eval/rollout (render-cost driven) | CNS v1 uses **1/50 s**; paper runs 30 s episodes |
 | 8 | **`--min-vel` filter** to drop sub-patch samples | With correct data generation this should be unnecessary — but keep the *reason* in mind (§6.3) |
@@ -284,8 +284,12 @@ ratio 0.003).
    most important unknown — it determines whether near-goal data, the
    hybrid→PBVS handover, or something else supplies sub-patch precision.
 2. **Exact Eq. 24 Jacobian** from [13]; validate against ViSP.
-3. **32k background textures** — source not identified. Paper says "background
-   textures (32k images)"; likely a texture dataset. Needs deciding.
+3. **32k background textures — we have ZERO.** `bproc_gen: rand_material()` only
+   randomises Principled BSDF base colour/roughness/metallic (procedural, no
+   images). The paper randomises over 32k background texture IMAGES *and*
+   materials. Cheapest large win available: BlenderProc ships a `cc_textures`
+   downloader (ambientCG, CC0) — `blenderproc download cc_textures <dir>`. Wire
+   into the ground-plane/background material. Untouched axis, unlike GSO.
 4. **Does `instance mask` (Fig. 3) feed the policy or only data generation?** We
    never used masks.
 5. **Two-stage schedule** ("short-sequence then extended-sequence refinement",
