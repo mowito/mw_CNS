@@ -163,17 +163,49 @@ to the wrong one will make a dead model look alive. Also check
 **output-varies-with-input** (pairwise cosine of outputs) and **ablate each input**
 (zero/shuffle it, measure output change) — that is how we found §6.5.
 
-### 6.3 Correspondence grid resolution — patches are 16 px
-`512/32 = 16 px` per patch. A 3 mm translation error at `d*≈1 m` with `fx=512` is
-~1.5 px = **0.4 patch**; measured paired `cos(Fc,Fd) = 0.9295` there (vs 0.59 far
-out) — the views are near-identical in feature space and the label is
-**unlearnable**. Worse, `sigma_inv(0.007) = −4.15` vs a median target of 1.49, so
-those **11% of samples produced 32% of the L1 magnitude loss** and stalled
-direction learning entirely (a 16k-iter run sat at `l_dir` 0.69 for 44
-validations). **Implication: the paper's TE ≈ 0.95 mm is far below one patch.**
-Understand how they achieve sub-patch precision (soft grid expectation? the
-hybrid→PBVS handover? finer `H16`?) before trusting any near-goal data floor.
-`cns/sim/pose_perturb.py` has `TE_MIN = 3 mm` — too small; ≥30 mm is ~1 patch.
+### 6.3 Correspondence grid resolution — and why it is NOT the blocker
+`512/32 = 16 px` per patch, so one patch of image displacement is
+`16 * depth / fx` metres:
+
+| d* (desired cam -> object) | 1 patch | 1 px |
+|---|---|---|
+| 0.475 m (our min) | 14.8 mm | 0.93 mm |
+| 0.703 m | 22.0 mm | 1.37 mm |
+| 1.0 m (paper canonical) | 31.2 mm | 1.95 mm |
+| 2.8 m | 87.8 mm | 5.49 mm |
+
+**The paper's TE = 0.948 mm at d*=1m is 0.485 px = ~1/33 of a patch.** No single
+-frame patch correspondence resolves that, so precision does NOT come from
+per-step spatial resolution. It comes from CLOSED-LOOP INTEGRATION: the paper
+runs 30 s episodes at 50 Hz = **1500 control steps**. A proportional law with an
+*unbiased* direction estimate decays error geometrically, so sub-pixel final
+accuracy is reachable from coarse per-step estimates. Our evals used **40** steps
+(~38x less integration), which is a far bigger handicap than the patch size.
+
+⇒ The question that matters near the goal is **bias, not precision**. Zero-mean
+noise still converges; a systematic bias stalls at the bias. MEASURE THIS: take a
+trained policy, put it at a range of small pose errors, and check whether the
+predicted direction is zero-mean about the true one. (An earlier version of this
+doc claimed "the 5 mm gate is below the architecture's resolution" -- that was too
+strong and is retracted.)
+
+Still true: samples far below one patch are near-unlearnable (measured paired
+`cos(Fc,Fd) = 0.93` in the `[0,0.05)` ||vel_si|| bin) AND carry extreme
+`sigma_inv` targets, so they distort the magnitude loss. Use `--min-vel` /
+`--balance` rather than letting them dominate; do not set `pose_perturb.TE_MIN`
+below ~1 patch at your working depth.
+
+### 6.3b DUPLICATED SAMPLERS — check every renderer entry point
+`cns/render/bproc_eval_server.py` carried its OWN copy of the old
+adaptive-frame-fill pose sampler. `bproc_gen.py` was migrated to
+`cns/sim/pose_sampling` and the server was missed, so for a full DAgger campaign
+**every rollout and every closed-loop eval silently ran on the OLD distribution**:
+measured d* 0.78-2.81 m and in-plane roll spread **0.0 deg**, versus 0.47-0.93 m /
+17.1 deg from bproc_gen. That put ~80% of the training data on the wrong
+distribution and meant the evals never tested in-plane roll at all -- the very
+thing the sampling fix was for. Both now import `pose_sampling`. If you add an
+IsaacSim renderer, import the sampler, never re-implement it, and verify with a
+d*/roll histogram per data source before trusting any number.
 
 ### 6.4 Schedule length must scale with dataset size
 `--iters` sets cosine `T_max`, but the learning need is in **epochs**. This head
@@ -280,9 +312,10 @@ ratio 0.003).
 
 ## 9. Open questions to resolve on the 5090
 
-1. **How does the paper reach TE ≈0.95 mm with 16 px patches?** (§6.3) This is the
-   most important unknown — it determines whether near-goal data, the
-   hybrid→PBVS handover, or something else supplies sub-patch precision.
+1. **RESOLVED (mostly), see §6.3**: sub-patch precision comes from closed-loop
+   integration over ~1500 steps, not per-frame resolution. The remaining question
+   is whether the policy's near-goal direction estimate is UNBIASED — that is what
+   decides if the loop converges to sub-mm or stalls. Measure it directly.
 2. **Exact Eq. 24 Jacobian** from [13]; validate against ViSP.
 3. **32k background textures — we have ZERO.** `bproc_gen: rand_material()` only
    randomises Principled BSDF base colour/roughness/metallic (procedural, no

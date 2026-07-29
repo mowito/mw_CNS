@@ -95,3 +95,96 @@ def precompute_backbone_features(net, images, device, batch=8, store_dtype=torch
         f = net.backbone(chunk)
         feats.append(f.to(store_dtype).cpu())
     return torch.cat(feats, dim=0)
+
+
+def build_feature_cache(scene_dir, net, device, out_dir, val_frac=0.1,
+                        policy=Policy.PBVS_Straight, intrinsic=None, batch=8,
+                        seed=0):
+    """STREAMING frozen-ViT feature cache -> on-disk .npy memmaps.
+
+    Replaces the load-everything-then-torch.save path, which cannot scale: at
+    7115 pairs that held Ic+Id (11.2GB uint8) plus Fc+Fd (11.2GB each fp16) for a
+    ~28GB peak and was OOM-killed (exit 137) on a 31GB box -- and torch.save()
+    additionally needs all 22.4GB resident to serialise. Projected 43GB at the
+    next DAgger round, 59GB at the one after.
+
+    Here peak RAM is ONE SCENE of images (~64MB) plus one GPU batch, regardless
+    of dataset size. Also ~5x less backbone work for the desired image: every
+    pair in a scene shares one desired view, so its features are computed once
+    and broadcast instead of recomputed per pair.
+
+    Fd IS DEDUPLICATED PER SCENE. Every pair in a scene shares one desired view,
+    so storing it per-pair duplicated it ~16x: at 16251 pairs / 980 scenes that is
+    25.6GB of redundancy and the cache (51.1GB) no longer fit the disk. Stored per
+    scene it is 1.5GB, and training maps pair -> scene via meta["scene_id"].
+
+    Layout:  <out_dir>/fc.npy   float16 [N, H16,W16,C]   per PAIR
+             <out_dir>/fd.npy   float16 [S, H16,W16,C]   per SCENE (deduped)
+             <out_dir>/meta.pt  vel_si, tPo_norm, tr, va, n_scenes, scene_id
+    """
+    import os, glob as _g
+    from cns.utils.perception import CameraIntrinsic
+
+    intr = intrinsic or CameraIntrinsic(512, 512, 512, 512, 256, 256)
+    dummy, dz = np.zeros((1, 2)), np.ones(1)
+    files = sorted(_g.glob(os.path.join(scene_dir, "scene_*.npz")))
+    if not files:
+        raise SystemExit(f"no scene_*.npz under {scene_dir}")
+
+    # ---- pass 1: labels only. npz is lazy, so reading poses/wP does NOT
+    # decompress the images -- this is cheap even for thousands of scenes.
+    per_file, vsis, tpos, scene_id = [], [], [], []
+    for fi, f in enumerate(files):
+        z = np.load(f)
+        poses, wP = z["poses"], z["wP"]
+        rows = []
+        for i in range(1, poses.shape[0]):
+            _, (tpo, vsi) = supervisor_vel(policy, dummy, dz, dummy, dz, intr,
+                                           poses[i], poses[0], wP)
+            rows.append(len(vsis))
+            vsis.append(vsi); tpos.append(tpo); scene_id.append(fi)
+        per_file.append((f, rows))
+    n = len(vsis)
+    print(f"[feat] {n} pairs from {len(files)} scenes; streaming to {out_dir}", flush=True)
+
+    os.makedirs(out_dir, exist_ok=True)
+    probe = net.backbone(torch.zeros(1, 3, 512, 512, device=device))
+    _, H16, W16, C = probe.shape
+    del probe
+    fc = np.lib.format.open_memmap(os.path.join(out_dir, "fc.npy"), mode="w+",
+                                   dtype=np.float16, shape=(n, H16, W16, C))
+    fd = np.lib.format.open_memmap(os.path.join(out_dir, "fd.npy"), mode="w+",
+                                   dtype=np.float16, shape=(len(files), H16, W16, C))
+
+    # ---- pass 2: one scene at a time ----
+    net.eval()
+    with torch.no_grad():
+        for si, (f, rows) in enumerate(per_file):
+            z = np.load(f)
+            imgs = z["images"]                       # [M+1,H,W,3] uint8
+            des = torch.from_numpy(imgs[0]).permute(2, 0, 1)[None].to(device)
+            fdes = net.backbone(des.float().div_(255.0)).to(torch.float16).cpu().numpy()[0]
+            for k0 in range(0, len(rows), batch):
+                idx = rows[k0:k0 + batch]
+                cur = torch.from_numpy(imgs[1 + k0:1 + k0 + len(idx)])
+                cur = cur.permute(0, 3, 1, 2).to(device).float().div_(255.0)
+                fcur = net.backbone(cur).to(torch.float16).cpu().numpy()
+                for j, r in enumerate(idx):
+                    fc[r] = fcur[j]
+            fd[si] = fdes                            # one row per scene (deduped)
+            if (si + 1) % 100 == 0:
+                print(f"[feat]   {si+1}/{len(per_file)} scenes", flush=True)
+    fc.flush(); fd.flush()
+
+    nv = max(8, int(n * val_frac))
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed))
+    torch.save({"vsi": torch.tensor(np.stack(vsis), dtype=torch.float32),
+                "tPo_norm": torch.tensor(np.array(tpos), dtype=torch.float32),
+                "tr": perm[nv:], "va": perm[:nv],
+                "n_scenes": len(files), "shape": (n, H16, W16, C),
+                "scene_id": torch.tensor(scene_id, dtype=torch.long)},
+               os.path.join(out_dir, "meta.pt"))
+    print(f"[feat] cached -> {out_dir} ({n} pairs, {(n+len(files))*H16*W16*C*2/1e9:.1f}GB on disk; "
+          f"fd deduped {n}->{len(files)} rows)",
+          flush=True)
+    return n

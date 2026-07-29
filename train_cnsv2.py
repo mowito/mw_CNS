@@ -14,7 +14,8 @@ import numpy as np
 import torch
 
 from cns.models.cnsv2_net import build_model
-from cns.sim.cnsv2_data import load_bproc_samples, precompute_backbone_features
+from cns.sim.cnsv2_data import (load_bproc_samples, precompute_backbone_features,
+                                build_feature_cache)
 
 CONFIG = {"K": 16, "feat_dim": 768, "intrinsic": {"fx": 512, "fy": 512, "cx": 256,
           "cy": 256, "H1": 512, "W1": 512}, "d_star": 1.0}
@@ -50,6 +51,19 @@ def main():
     # dominated the gradient and stalled direction learning entirely
     # (16k-iter run: l_dir flat at 0.69 for 44 validations, l_norm stuck ~1.05).
     # 0.05 keeps the USEFUL near-goal band (~1.2-6 patches) and drops the rest.
+    # Stratified batch sampling over ||vel_si|| bins. DAgger rollout states are
+    # inherently near-goal-heavy -- expert convergence is geometric, so most steps
+    # of a converging trajectory sit near the goal (measured: 79.4% of round-0
+    # rollouts had ||vel_si||<0.5). Aggregating those onto a far-heavy uniform set
+    # drifted the mix 1.8% -> 41% -> 56.3% near-goal across rounds, and the
+    # closed-loop TE ratio got WORSE (1.350 -> 1.569) even as offline l_dir
+    # improved 2% -> 64% over baseline: the model gained near-goal skill and lost
+    # the far field, which is where every episode starts. The paper avoids this by
+    # running uniform and DAgger sampling CONCURRENTLY (Fig. 3) so the database
+    # stays balanced; we aggregate, so we rebalance here instead. Reweights rather
+    # than discards, so no data is thrown away.
+    ap.add_argument("--balance", action="store_true",
+                    help="stratified batch sampling over ||vel_si|| bins")
     ap.add_argument("--min-vel", type=float, default=0.0,
                     help="drop samples with ||vel_si|| below this (sub-patch, unlearnable)")
     # This head overfits 1850 pairs by ~iter 1000 (val l_dir bottoms at 0.596 then
@@ -65,58 +79,33 @@ def main():
     print(f"[load] {args.data}", flush=True)
     net = build_model(K=CONFIG["K"], refine_layers=4, ctrl_dim=256).to(dev)
 
-    # Cache precomputed frozen-ViT features to disk so job restarts are cheap
-    # (skip render-load + ~5min backbone recompute on every resume).
-    cache = args.out.replace(".pth", "_feat.pt")
+    # Frozen-ViT feature cache, STREAMED to on-disk .npy memmaps.
+    # The previous single-.pt cache could not scale: at 7115 pairs it held
+    # Ic+Id (11.2GB uint8) + Fc+Fd (11.2GB each fp16) for a ~28GB peak and was
+    # OOM-killed (exit 137) on this 31GB box, and torch.save() additionally needs
+    # every byte resident to serialise. build_feature_cache() streams one scene at
+    # a time (peak ~64MB) and training then demand-pages 8 rows per step.
+    cache = args.out.replace(".pth", "_feat")          # a DIRECTORY now
     import glob as _g
     n_scenes = len(_g.glob(os.path.join(args.data, "scene_*.npz")))
-    if os.path.exists(cache):
-        # mmap the feature cache instead of reading it into RAM. At 1400 scenes it
-        # is 18.8GB (Fc+Fd, fp16) and a plain load OOM-killed training on this
-        # 31GB box (exit 137) -- the process held 18.8GB anonymous while 18.8GB of
-        # dirty pages from having just written the file were still flushing.
-        # Training only ever indexes 8 rows at a time, so demand-paging is a
-        # strictly better fit than resident tensors.
-        try:
-            blob = torch.load(cache, map_location="cpu", mmap=True)
-        except (TypeError, RuntimeError) as e:
-            print(f"[feat] mmap load unavailable ({type(e).__name__}), "
-                  f"falling back to full read", flush=True)
-            blob = torch.load(cache, map_location="cpu")
-        Fc, Fd, vsi, tr, va = blob["Fc"], blob["Fd"], blob["vsi"], blob["tr"], blob["va"]
-        # The cache used to be trusted on existence alone, so rendering MORE scenes
-        # into --data and relaunching would silently keep training on the old
-        # sample set. Refuse to run when the scene count no longer matches.
-        cached_scenes = blob.get("n_scenes")
-        if cached_scenes is None:
-            print(f"[feat] WARNING: cache {cache} predates the scene-count guard; "
-                  f"it holds {Fc.shape[0]} samples while {args.data} now has "
-                  f"{n_scenes} scenes. Delete the cache if you added scenes.", flush=True)
-        elif cached_scenes != n_scenes:
-            raise SystemExit(
-                f"[feat] STALE CACHE: {cache} was built from {cached_scenes} scenes but "
-                f"{args.data} now has {n_scenes}. Training on it would ignore the new "
-                f"scenes. Delete it and rerun:\n    rm {cache}")
-        print(f"[feat] loaded cache {cache}: {Fc.shape[0]} samples "
-              f"({cached_scenes if cached_scenes is not None else '?'} scenes)", flush=True)
-    else:
-        d = load_bproc_samples(args.data)
-        n = d["Ic"].shape[0]
-        nv = max(8, int(n * args.val_frac))
-        perm = torch.randperm(n)
-        tr, va = perm[nv:], perm[:nv]
-        print(f"[load] {n} samples -> train {len(tr)} / val {len(va)}; precomputing feats...", flush=True)
-        import gc
-        Fc = precompute_backbone_features(net, d["Ic"], dev)   # CPU fp16
-        d["Ic"] = None; gc.collect()      # release before allocating Fd
-        Fd = precompute_backbone_features(net, d["Id"], dev)
-        d["Id"] = None; gc.collect()
-        vsi = d["vel_si"]
-        torch.save({"Fc": Fc, "Fd": Fd, "vsi": vsi, "tr": tr, "va": va,
-                    "n_scenes": n_scenes}, cache)
-        del d                                    # free ~11GB of raw images (avoid OOM)
-        import gc; gc.collect()
-        print(f"[feat] cached -> {cache}", flush=True)
+    meta_p = os.path.join(cache, "meta.pt")
+    if not os.path.exists(meta_p):
+        build_feature_cache(args.data, net, dev, cache, val_frac=args.val_frac)
+    meta = torch.load(meta_p, map_location="cpu")
+    # Scene-count guard: adding scenes then reusing a stale cache would silently
+    # train on the old sample set (this bit us once).
+    if meta.get("n_scenes") != n_scenes:
+        raise SystemExit(
+            f"[feat] STALE CACHE: {cache} was built from {meta.get('n_scenes')} scenes "
+            f"but {args.data} now has {n_scenes}. Delete it and rerun:\n    rm -rf {cache}")
+    Fc = np.load(os.path.join(cache, "fc.npy"), mmap_mode="r")
+    Fd = np.load(os.path.join(cache, "fd.npy"), mmap_mode="r")
+    vsi, tr, va = meta["vsi"], meta["tr"], meta["va"]
+    # fd.npy has ONE row per scene (the desired view is shared by every pair in a
+    # scene); scene_id maps pair -> scene. Saves ~16x on fd.
+    scene_id = meta.get("scene_id")
+    print(f"[feat] cache {cache}: {Fc.shape[0]} pairs ({n_scenes} scenes), "
+          f"train {len(tr)} / val {len(va)}", flush=True)
 
     if args.min_vel > 0:
         keep = (vsi.norm(dim=-1) >= args.min_vel)
@@ -127,6 +116,19 @@ def main():
         nn = vsi[tr].norm(dim=-1)
         print(f"[filter] remaining ||vel_si||: min {nn.min():.4f} median {nn.median():.3f}; "
               f"near-goal(<0.5) now {100*(nn < 0.5).float().mean():.1f}% of train", flush=True)
+
+    samp_w = None
+    if args.balance:
+        edges = torch.tensor([0.1, 0.25, 0.5, 1.0, 2.0])
+        nrm = vsi.norm(dim=-1)[tr]
+        b = torch.bucketize(nrm, edges)
+        cnt = torch.bincount(b, minlength=len(edges) + 1).float().clamp_min(1.0)
+        samp_w = (1.0 / cnt[b])
+        samp_w = samp_w / samp_w.sum()
+        share = (cnt / cnt.sum() * 100)
+        print(f"[balance] train bin counts {cnt.long().tolist()} "
+              f"(= {[f'{x:.1f}%' for x in share.tolist()]}) -> equalised by resampling",
+              flush=True)
 
     decay, no_decay = net.get_parameter_groups()
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": 1e-2},
@@ -146,8 +148,14 @@ def main():
         start_it = ck.get("iters_done", 0)
         print(f"[resume] {cks[-1]} @ iter {start_it}", flush=True)
 
+    def _take(arr, idx):
+        """Fc/Fd are numpy memmaps; fancy-indexing copies just the needed rows."""
+        return torch.from_numpy(np.ascontiguousarray(arr[idx.cpu().numpy()]))
+
     def batch_forward(idx):
-        fc = Fc[idx].to(dev).float(); fd = Fd[idx].to(dev).float()
+        fc = _take(Fc, idx).to(dev).float()
+        didx = idx if scene_id is None else scene_id[idx]
+        fd = _take(Fd, didx).to(dev).float()
         return net.head_forward(fc, fd)
 
     @torch.no_grad()
@@ -186,7 +194,10 @@ def main():
     print(f"[train] {args.iters} iters (from {start_it}), batch {args.batch}, fp32", flush=True)
     net.train(); t0 = time.time(); hist = []
     for it in range(start_it, args.iters):
-        idx = tr[torch.randint(0, len(tr), (args.batch,))]
+        if samp_w is not None:
+            idx = tr[torch.multinomial(samp_w, args.batch, replacement=True)]
+        else:
+            idx = tr[torch.randint(0, len(tr), (args.batch,))]
         opt.zero_grad(set_to_none=True)
         raw = batch_forward(idx)
         _, loss = net.objectives(raw, vsi[idx].to(dev), args.norm_weight)

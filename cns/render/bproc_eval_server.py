@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 # blenderproc is already imported above, so re-importing it inside bproc_gen is a
 # no-op -- lets us reuse the exact scene-building used to make the training set.
 from cns.render.bproc_gen import look_at_cv, _CV2GL, rand_material, make_objects
+from cns.sim.pose_sampling import sample_desired, sample_initial
 
 
 def touch(p):
@@ -94,16 +95,16 @@ def main():
         scene_center = 0.5 * (lo + hi)
         scene_radius = float(0.5 * np.linalg.norm(hi - lo)) + 1e-3
 
-        def sample_pose():
-            fill = rng.uniform(0.45, 0.75)
-            r = float(np.clip(2.0 * scene_radius / fill, 0.35, 3.0))
-            th = rng.uniform(0, 6.28); ph = rng.uniform(np.radians(20), np.radians(75))
-            eye = scene_center + r * np.array(
-                [np.cos(ph) * np.cos(th), np.cos(ph) * np.sin(th), np.sin(ph)])
-            return look_at_cv(eye, scene_center + rng.uniform(-0.05, 0.05, 3))
-
-        tar = sample_pose()
-        cur0 = sample_pose()
+        # CNS-v1 sampling, matching bproc_gen. This file used to carry its OWN
+        # copy of the old adaptive-frame-fill sampler (r clipped to [0.35,3.0],
+        # zero in-plane roll, symmetric desired/initial). bproc_gen was migrated
+        # to cns/sim/pose_sampling and this was missed, so every DAgger rollout
+        # and every closed-loop eval ran on the OLD distribution -- measured d*
+        # 0.78-2.81m and roll spread 0.0 deg, versus 0.47-0.93m / 17.1 deg from
+        # bproc_gen. That silently put 80% of the training data on the wrong
+        # distribution and meant the evals never tested in-plane roll at all.
+        tar = sample_desired(rng, scene_center)
+        cur0 = sample_initial(rng, scene_center)
         desired = render_pose(tar)
         np.savez(os.path.join(W, f"ep{ep}_meta.npz"),
                  tar=tar, cur0=cur0, wP=centers, desired=desired)
