@@ -38,6 +38,22 @@ rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SYNC="${OUT%.pth}_sync.pth"
 ISAAC=${ISAAC:-$HOME/isaacsim}
 
+# The trainer and collectors were invoked as bare `python`, which resolves only
+# inside an activated cnsv2 env. Launched detached (nohup/setsid/cron) it does
+# not resolve, and because the check would otherwise come AFTER the render
+# servers, the failure surfaced as `python: command not found` four minutes of
+# IsaacSim startup later. Overridable, and verified before anything is spawned.
+PYTHON=${PYTHON:-python}
+command -v "$PYTHON" >/dev/null 2>&1 || {
+  echo "[run] '$PYTHON' not on PATH -- activate the cnsv2 env or pass PYTHON=/path/to/python"
+  exit 127
+}
+"$PYTHON" -c "import torch" 2>/dev/null || {
+  echo "[run] '$PYTHON' cannot import torch -- wrong interpreter?"
+  exit 127
+}
+echo "[run] python: $(command -v "$PYTHON")"
+
 PIDS=()
 cleanup() {
   echo "[run] shutting down ${#PIDS[@]} helper processes..."
@@ -74,7 +90,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
   [ -f "$WD/READY" ] || { echo "[run] server $i never became READY"; tail -25 "$LOGDIR/server_$i.log"; exit 1; }
 
   echo "[run] env $i: DAgger collector -> $LOGDIR/collect_$i.log"
-  CUDA_VISIBLE_DEVICES=1 python collect_dagger.py \
+  CUDA_VISIBLE_DEVICES=1 "$PYTHON" collect_dagger.py \
     --ckpt "$SYNC" --workdir "$WD" --out "$DAGGER_DIR" \
     --episodes "$EPISODES" --watch --beta 1.0 --beta-final 0.3 \
     --seed $((2000 + i)) --tag "i$i" \
@@ -83,7 +99,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
 done
 
 echo "[run] 3/3 training on GPU 0 -> $LOGDIR/train.log"
-CUDA_VISIBLE_DEVICES=0 python train_cnsv2.py \
+CUDA_VISIBLE_DEVICES=0 "$PYTHON" train_cnsv2.py \
   --data "$DATA" --out "$OUT" --iters "$ITERS" --batch 16 \
   --dagger-dir "$DAGGER_DIR" --sync-path "$SYNC" \
   --sync-every 500 --ingest-every 200 --patience 0 \

@@ -343,7 +343,9 @@ def main():
             idx = tr[torch.multinomial(samp_w, n_u, replacement=True)] if n_u else tr[:0]
         else:
             idx = tr[torch.randint(0, len(tr), (n_u,))] if n_u else tr[:0]
-        didx = (torch.randint(0, pool.n_pairs, (n_d,)) if n_d else None)
+        # pool.sample, not randint(0, n_pairs): eviction leaves the live rows a
+        # scattered subset of the reserve, so a prefix draw would hit dead slots.
+        didx = (pool.sample(n_d) if n_d else None)
 
         opt.zero_grad(set_to_none=True)
         with amp_ctx():
