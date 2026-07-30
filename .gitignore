@@ -162,3 +162,5 @@ cns/temp/
 cns/benchmark/results/
 *.pkl
 *.npz
+checkpoints/
+data/

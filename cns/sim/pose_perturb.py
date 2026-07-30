@@ -30,10 +30,25 @@ L1 magnitude loss.
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-# Defaults span the convergence funnel: from just under the 5mm/1deg success
-# gate up to where the independent-sampling distribution already has coverage.
-TE_MIN, TE_MAX = 0.003, 0.30      # metres
-RE_MIN, RE_MAX = 0.3, 30.0        # degrees
+# Defaults span the convergence funnel up to where the independent-sampling
+# distribution already has coverage.
+#
+# TE_MIN IS ONE CORRESPONDENCE PATCH, NOT THE SUCCESS GATE. It used to be 0.003 m,
+# chosen to sit "just under the 5mm success gate" -- but the coarse grid is
+# 512/32 = 16 px, so at the working depth of ~0.7 m one patch is
+# 16 * 0.7 / 512 = 21.9 mm. A 3 mm perturbation is 1/7 of a patch: the two views
+# are nearly identical in feature space (measured paired cos(Fc,Fd) = 0.93 in the
+# [0,0.05) ||vel_si|| bin) so the label is unlearnable, AND sigma_inv(y)=1+log(y)
+# reaches -4.15 there against a median target of 1.49, so those samples dominated
+# the L1 magnitude loss. That is the recorded cause of the failed run in
+# PAPER_FAITHFUL_5090.md Sec. 8 ("1400 scenes, +near-goal (TE_MIN 3 mm),
+# val l_dir 0.6748 -- failed"), and Sec. 6.3 says outright: do not set TE_MIN
+# below ~1 patch at your working depth.
+#
+# Sub-millimetre final accuracy does NOT come from resolving sub-patch errors in
+# one frame; it comes from closed-loop integration over the paper's 1500 steps.
+TE_MIN, TE_MAX = 0.025, 0.30      # metres (0.025 ~= 1 patch at d* ~ 0.7 m)
+RE_MIN, RE_MAX = 0.5, 30.0        # degrees
 
 
 def sample_error_magnitudes(rng, te_min=TE_MIN, te_max=TE_MAX,

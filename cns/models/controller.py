@@ -62,9 +62,11 @@ class _SelfBlock(nn.Module):
 
 class NeuralController(nn.Module):
     def __init__(self, feat_dim: int, grid_dim: int, dim: int = 256,
-                 n_self: int = 3, heads: int = 8, regress_norm: bool = True):
+                 n_self: int = 3, heads: int = 8, regress_norm: bool = True,
+                 fine_dim: int = 0):
         super().__init__()
         self.regress_norm = regress_norm
+        self.fine_dim = fine_dim
         # project coarse current features and the probability grid into token space.
         # P is a distribution over grid_dim=K*K cells, so its entries sit at ~1/K^2
         # (~4e-3) while the refined ViT features are LayerNorm'd to std~1. Feeding P
@@ -76,7 +78,15 @@ class NeuralController(nn.Module):
         self.feat_proj = nn.Linear(feat_dim, dim)
         self.grid_norm = nn.LayerNorm(grid_dim)
         self.grid_proj = nn.Linear(grid_dim, dim)
-        self.fuse = nn.Linear(2 * dim, dim)
+        # Third stream: fine-grained CNN features (paper Fig. 2 / cns/models/fine_cnn.py).
+        # Fig. 2 concatenates the CNN output with P before the self-attention stack;
+        # Eq. 10 additionally names F_c, so all three streams are fused here. Set
+        # fine_dim=0 to reproduce the coarse-only ablation.
+        n_stream = 3 if fine_dim else 2
+        if fine_dim:
+            self.fine_norm = nn.LayerNorm(fine_dim)
+            self.fine_proj = nn.Linear(fine_dim, dim)
+        self.fuse = nn.Linear(n_stream * dim, dim)
         self.self_blocks = nn.ModuleList([_SelfBlock(dim, heads) for _ in range(n_self)])
         # learned action token cross-attends into the fused tokens (grid-conditioned)
         self.action_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
@@ -86,13 +96,21 @@ class NeuralController(nn.Module):
         self.dir_head = nn.Linear(dim, 6)                 # v~_dir
         self.norm_head = nn.Linear(dim, 1) if regress_norm else None   # l~
 
-    def forward(self, Fc: torch.Tensor, P: torch.Tensor, hidden=None):
-        """Fc: [B,H,W,feat_dim] (refined current features), P: [B,H,W,grid_dim].
+    def forward(self, Fc: torch.Tensor, P: torch.Tensor, hidden=None, fine=None):
+        """Fc: [B,H,W,feat_dim] (refined current features), P: [B,H,W,grid_dim],
+        fine: [B,H,W,fine_dim] CNN fine-grained features or None.
         Returns (vec [B,6], log_norm [B,1] or None, hidden(passthrough))."""
         B, H, W, _ = Fc.shape
         tf = self.feat_proj(Fc.reshape(B, H * W, -1))
         tg = self.grid_proj(self.grid_norm(P.reshape(B, H * W, -1)))
-        tok = self.fuse(torch.cat([tf, tg], dim=-1))       # [B,N,dim]
+        streams = [tf, tg]
+        if self.fine_dim:
+            if fine is None:
+                raise ValueError(
+                    "controller was built with fine_dim>0 but no fine features were "
+                    "passed -- the CNN branch needs the raw image pair (Fig. 2)")
+            streams.append(self.fine_proj(self.fine_norm(fine.reshape(B, H * W, -1))))
+        tok = self.fuse(torch.cat(streams, dim=-1))         # [B,N,dim]
         for blk in self.self_blocks:
             tok = blk(tok)
         act = self.action_token.expand(B, 1, -1)

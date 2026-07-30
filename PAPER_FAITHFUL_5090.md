@@ -1,5 +1,64 @@
 # CNSv2 — paper-faithful recreation on the 5090 / Ubuntu 24 box
 
+> ## STATUS — updated on the 5090 box, 2026-07-29
+>
+> Most of §3–§5 below is now **done**, and several claims in the original text are
+> **wrong or superseded**. Read this block before trusting anything downstream.
+>
+> **Environment (all verified):** conda env `cnsv2`, torch 2.11.0+cu128, **2×
+> RTX 5090** (32 GB each, both `cap=(12,0)`, real matmul + bf16 checked),
+> Threadripper PRO 9975WX, 62 GB RAM, driver 595.58.03. IsaacSim 6.0.1 at
+> `~/isaacsim` (bundled python 3.12.13, **no torch** — hence the IPC split below).
+>
+> **Assets:** 944 GSO models copied byte-exact and converted to USD
+> (`data/gso_usd`); **980 HDRIs** (§4 said 155 — wrong, and the paper only asks
+> 733); **1989 ambientCG CC0 background textures** (§9.3 said ZERO). AM-RADIOv2.5
+> weights cached and verified: `(1,32,32,768)`, 98.2 M frozen params.
+>
+> **§5 IsaacSim port: DONE and measured.** `cns/render/isaac_scene.py` +
+> `cns/render/isaac_eval_server.py`. The "expectation, not a measured fact" is now
+> a fact: **113 ms/frame** for full randomized scenes vs BlenderProc's 702 ms
+> (~6×), and **18 ms/frame** for repeated renders of one scene. `rt_subframes`
+> turned out not to matter (PSNR 47–52 dB at every setting 1→32) and there is **no
+> scene-change staleness** even at `warmup=0` — both measured by
+> `scripts/bench_isaac.py`. RSS is flat across scenes, so §6.8's Blender leak is
+> gone. This makes the paper's `dt=1/50` affordable, so `eval_servo*.py` and
+> `collect_dagger.py` now default to **dt=1/50 and 1500-step episodes**.
+>
+> **A 10th compromise, missing from §4 entirely: the Fig. 2 fine-grained CNN
+> branch did not exist.** `controller.py` fused only ViT/16 coarse features with
+> `P`. Fig. 2's caption and §I are explicit that a low-cost conv branch on the raw
+> image pair is fused in "to capture the pixel-wise error to improve the servo
+> precision" — that is the paper's mechanism for sub-patch precision and it bears
+> directly on §6.3 and §8. Now `cns/models/fine_cnn.py` (0.187 M params), fused as
+> a third stream; gradient flow and ablation effect both verified.
+>
+> **§4 item 6 / §9.2 RESOLVED — with a correction (2026-07-30): Malis Eq. 23 is
+> NOT paper Eq. 24.** Malis 1999 is at `/home/mowito/Downloads/Malis2-1-2DTRA99.pdf`
+> and is transcribed exactly in `hybrid_control.py` (`hybrid_velocity`), verified
+> against the numeric inverse of his Eq. 21 to 1.8e-15. But an earlier version of
+> this block claimed the two laws coincide with the gravity centre as reference
+> point — **wrong, and measurably so**. The paper's own e-vector (§2 below) is
+> `[d t̂_c ; cX̂_g − dX̂_g ; θ̂û_z]`: translation from the Cartesian estimate, image
+> error steering rotation only. Malis is the opposite split. Both converge on
+> ground truth; on NETWORK estimates the Malis form let far-field phantom matching
+> drive translation and diverged to 10.3 m in closed loop. Deployment and rollouts
+> use `hybrid_velocity_eq24` (the paper's composition, with Malis's interaction
+> blocks); [13] is the source of the *blocks*, not the composition of e. Full
+> story in the `hybrid_control.py` docstring. **ViSP is still not needed.**
+>
+> **§4 item 2 / Fig. 3 concurrent DAgger: implemented.**
+> `scripts/run_concurrent_dagger.sh` runs N render servers + N collectors (Fig. 3's
+> "Env 1..N") on GPU 1 and training on GPU 0, with `<out>_sync.pth` as the
+> "Synchronize Weights Periodically" channel and `cns/sim/dagger_pool.py` as a
+> growable half of the database mixed in at a fixed `--dagger-frac`.
+>
+> **New gotchas found here — see §6.11–6.14 at the end of this document.** The
+> worst one silently collapsed appearance diversity across all 944 objects.
+>
+> Verification gates 1–4 all pass; see `scripts/run_gates.py` and
+> `scripts/verify_isaac_data.py`.
+
 **Audience:** a fresh Claude Code instance on the 5090 machine.
 **Goal:** reproduce CNSv2 (arXiv 2503.00132, *Probabilistic Correspondence Encoded
 Neural Image Servo*) faithfully — Table I baseline config, §G safe velocity
@@ -316,15 +375,144 @@ ratio 0.003).
    integration over ~1500 steps, not per-frame resolution. The remaining question
    is whether the policy's near-goal direction estimate is UNBIASED — that is what
    decides if the loop converges to sub-mm or stalls. Measure it directly.
-2. **Exact Eq. 24 Jacobian** from [13]; validate against ViSP.
-3. **32k background textures — we have ZERO.** `bproc_gen: rand_material()` only
-   randomises Principled BSDF base colour/roughness/metallic (procedural, no
-   images). The paper randomises over 32k background texture IMAGES *and*
-   materials. Cheapest large win available: BlenderProc ships a `cc_textures`
-   downloader (ambientCG, CC0) — `blenderproc download cc_textures <dir>`. Wire
-   into the ground-plane/background material. Untouched axis, unlike GSO.
-4. **Does `instance mask` (Fig. 3) feed the policy or only data generation?** We
-   never used masks.
-5. **Two-stage schedule** ("short-sequence then extended-sequence refinement",
-   plan doc §6) — never implemented.
-6. **OmniObject3D acquisition** (~1.2 TB, openxlab). User plans GSO first.
+2. **CLOSED — exact Eq. 24 Jacobian.** Malis 1999 is on the box and transcribed in
+   `cns/models/hybrid_control.py`; see the STATUS block. **ViSP is not needed**: the
+   reason the plan doc wanted a second source was that a from-scratch PBVS is easy
+   to get wrong, and transcribing the cited paper directly removes that risk.
+   `tests/test_malis_hybrid.py` checks the closed form against the numeric inverse
+   of Malis's own Eq. 21 matrix, which is a stronger check than agreeing with
+   another library's conventions.
+3. **PARTLY CLOSED — background textures: 1989, not zero.** `data/cc_textures`
+   holds ambientCG's entire CC0 material set, wired into the ground-plane material
+   in `isaac_scene.py` (`_make_textured_material`, randomized per scene along with
+   roughness/metallic and UV tiling). Still short of the paper's 32k: ambientCG is
+   *exhausted* at 2005 assets, and the paper never names its source. Closing the
+   rest needs a different corpus (e.g. DTD, 5640 images) — an open question about
+   what the paper actually used, not a missing download.
+4. **Does `instance mask` (Fig. 3) feed the policy or only data generation?** Still
+   open. The Isaac renderer now SAVES masks (`masks` key, uint32) so the experiment
+   is cheap to run, but nothing consumes them yet.
+5. **NOT APPLICABLE — two-stage schedule.** This is not a CNSv2 idea. It comes from
+   `CNSv2_5090_SETUP.md` §6, which attributes it to "CNS v1's own README
+   precedent", and in v1 it is two scripts (`cns/train_gvs_short_seq.py` →
+   `cns/train_gvs_long_seq.py`, with `dataset.py` → `dataset_long.py`).
+   **v1 needs it because v1 is recurrent**: `cns/models/graph_vs.py:155` defines a
+   `PEConvGRUCell` used as `self.temporal_aggr` (line 239), both v1 trainers thread
+   `hidden_train`/`hidden_valid` through an episode, and the short-sequence trainer
+   uses `steps_for_update=8` for truncated BPTT. Short-then-long is the standard
+   curriculum for that.
+   **CNSv2 is stateless**, so there is nothing to curriculum: `controller.py:122`
+   returns the `hidden` it was passed untouched — it exists only to satisfy the CNS
+   v1 trainer contract — and no recurrent cell appears anywhere in the v2 path.
+   That matches the paper: Fig. 2 is feedforward, the loss (Eq. 22–23) is a
+   per-sample regression, and §IV-A trains i.i.d. at batch 16 for ~40k iterations.
+   The role a long-sequence stage would play — exposing the policy to its own
+   compounding long-horizon error — is filled by DAgger, which the paper *does*
+   specify (§H, Fig. 3) and which is now implemented.
+   ⚠️ Revisit only if recurrence is ever added to the v2 controller; the `hidden`
+   passthrough is a deliberate hook for that.
+6. **OmniObject3D acquisition** (~1.2 TB, openxlab). Still open and now
+   disk-blocked: this box has ~277 GB free on a single 915 GB NVMe, so the
+   944/6852 model gap cannot be closed without another drive.
+
+---
+
+## 6.11–6.14 New gotchas found on the 5090 box (2026-07-29)
+
+### 6.11 One shared texture across all 944 GSO models — the worst bug found
+`omni.kit.asset_converter` writes extracted textures to
+`<output_dir>/materials/textures/<basename>`. **Every GSO model's texture is named
+`meshes/texture.png`**, so converting all 944 into one flat output directory made
+all 944 `.usd` files reference a single shared `materials/textures/texture.png` —
+whichever model converted last. Renders came back with every object in every scene
+wearing the same skin, destroying the appearance-diversity axis of the paper's
+domain randomization.
+
+**Nothing statistical caught this.** Pose distributions, `‖vel_si‖` histograms,
+image std, and frame-difference checks were all clean. It was visible only in a
+contact sheet. `scripts/convert_gso_to_usd.py` now writes one directory per model,
+and `IsaacSceneGen` hard-refuses a flat conversion that has a shared
+`materials/textures/`. **Look at your images.**
+
+### 6.12 DAgger rollout states pile up at the goal and are unlearnable
+Saving every visited state of a converging rollout is wrong. Convergence is
+geometric, so at `dt=1/50` most of the ~265 steps sit within millimetres of the
+goal: a measured round gave **median `‖vel_si‖` 0.027 (~0.45 of a 16 px patch)
+with 97.3 % below 0.5**. Those samples are individually unlearnable (paired
+`cos(Fc,Fd) = 0.93` in that bin) and their `sigma_inv` targets dominate the
+magnitude loss — the same mechanism as §6.3.
+
+Two independent guards, because this is easy to reintroduce:
+`collect_dagger.py --states-per-ep` keeps states **log-uniform in translation
+error** (48 per episode), and `DaggerPool(min_vel=0.05)` rejects sub-patch pairs at
+ingest whatever the collector did. After both: median 0.278, min 0.052.
+
+Relatedly, **`pose_perturb.TE_MIN` was 3 mm**, which is 1/7 of a patch at the
+working depth (one patch = 16·0.7/512 = 21.9 mm). That is the recorded cause of
+the failed run in §8. It is now 25 mm. §6.3 already said not to do this.
+
+### 6.13 Camera poses must be sampled about the SCENE centre
+`bproc_gen.py:120-123` computes the object bounding-box centre and samples poses
+about it. An IsaacSim port that samples about the world origin instead gets
+different framing and a different `d*` for the same nominal radius, because
+objects scatter over ±0.18 m. Renderers must agree on this or §6.9's
+"evaluate in the domain you trained in" is violated by construction.
+
+### 6.14 Small traps that cost real time
+- **`np.savez_compressed` appends `.npz`** if the filename lacks it. A temp file
+  named `x.npz.tmp` becomes `x.npz.tmp.npz` and the subsequent `os.replace` fails.
+  Temp names must already end in `.npz`. (Needed at all because the trainer scans
+  the DAgger directory while the collector writes it — half-written files read as
+  `BadZipFile`, which `DaggerPool.ingest` skips *without* marking them ingested.)
+- **IsaacSim `multi_gpu` defaults on** and warns "CUDA Peer Memory Copies from
+  device[0] to device[1] is NOT possible... copies across GPUs will go through main
+  memory". Turn it off and pin one GPU; that is also what frees the other card for
+  training.
+- **Randomized dome intensity produces unusable frames.** 7 of 2800 came back
+  near-black, i.e. a good pose label attached to an image with no signal.
+  `IsaacSceneGen.auto_expose()` rescales against the desired view.
+- **Inference scripts must not hardcode the architecture.** `fine_dim` is a real
+  switch (`--fine-dim 0` is the coarse-only ablation), so
+  `build_from_checkpoint()` reads shapes from the state dict. Three scripts
+  previously worked only because a constructor default happened to match.
+- **`ParticleToGrid` needs 9 scatter offsets, not 16.** Offsets `{-1,0,1}` per axis
+  are exactly the `|a|<1.5` B-spline support; `2` and `-2` contribute identically
+  zero.
+
+### 6.15 THE VAL SPLIT WAS LEAKY — val l_dir measured memorization
+`build_feature_cache` split **pairs**, not **scenes**:
+```python
+perm = torch.randperm(n); tr, va = perm[nv:], perm[:nv]      # WRONG
+```
+Every pair in a scene shares that scene's desired view, objects, background
+texture, HDRI and exposure. So a "held-out" pair sat inside a scene the model had
+trained on: measured **100.0% of val pairs came from scenes also in train**.
+
+What that hid, on the first full 40k run (checkpoint `cnsv2_best.pth`,
+best val l_dir 0.1878):
+
+| split | l_dir | best-constant |
+|---|---|---|
+| SEEN scenes (`isaac_train`) | **0.038** | 0.746 |
+| UNSEEN scenes (`isaac_pilot`) | **0.243** | 0.742 |
+
+A **6.4x** generalization gap the val curve could not see, while the reported
+0.1878 sat between the two. Both still beat the constant baseline, so the model
+did learn something real — but the number being optimized and early-stopped on
+was mostly memorization, and closed loop diverged from **80 mm** starts on fresh
+scenes even in a brightness-matched domain.
+
+Fixed: the split is now scene-disjoint, and `train_cnsv2.py` **hard-errors** on a
+cache whose val scenes overlap train (old caches must be deleted).
+
+**Diagnostic order that found it** — worth reusing, since three plausible
+suspects were eliminated by measurement before the real one:
+1. oracle closed loop → 20/20, TE ratio 0.008 ⇒ harness/integrator fine
+2. GT label → `postprocess` → `integrate` → 10/10 at 2.0 mm ⇒ deployment path fine
+3. brightness histograms ⇒ found a REAL train/eval gap (the eval server did not
+   `auto_expose` like the generator; fixed) — but it was **not** the cause
+4. scene overlap between tr/va ⇒ the cause
+
+Also: `--patience` and best-checkpoint tracking were both keyed to the leaky
+metric, so "best" was selected on memorization. Re-run before trusting any
+checkpoint selected this way.

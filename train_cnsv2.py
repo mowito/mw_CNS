@@ -25,7 +25,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="BlenderProc scene dir (scene_*.npz)")
     ap.add_argument("--iters", type=int, default=40000)
-    ap.add_argument("--batch", type=int, default=8)
+    # Paper Sec. IV-A trains at batch 16 for ~40k iterations. The 4060 box ran 8
+    # because 8GB of VRAM could not hold more; 32GB per 5090 can.
+    ap.add_argument("--batch", type=int, default=16)
+    # Paper Sec. I: "we employ mixed floating point training and inference so the
+    # model runs in real-time". bf16 rather than fp16 because the feature
+    # correlation overflows fp16's 65504 range; prob_match.py additionally forces
+    # score_matrix and particle-to-grid to fp32 regardless of the autocast dtype.
+    ap.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"])
+    ap.add_argument("--fine-dim", type=int, default=128,
+                    help="fine-grained CNN branch width (Fig. 2); 0 disables it")
     ap.add_argument("--val-batch", type=int, default=8,
                     help="val forward chunk size; full-split at once OOMs on 8GB")
     # 3e-4 COLLAPSES this head onto the constant (mean-velocity) solution: output
@@ -72,12 +81,36 @@ def main():
     # track the best val l_dir and stop when it stops improving.
     ap.add_argument("--patience", type=int, default=8,
                     help="stop after this many validations with no val l_dir gain (0=off)")
+    # ---- concurrent DAgger (paper Fig. 3) --------------------------------
+    # Not a phase 2. The collector runs at the same time as this process, reading
+    # weights from --sync-path; we ingest whatever rollouts have landed and mix
+    # them in at a FIXED fraction. The fixed fraction is the point: aggregating
+    # whole DAgger rounds previously drifted the mix to 56% near-goal and made the
+    # closed loop worse (see cns/sim/dagger_pool.py).
+    ap.add_argument("--dagger-dir", default="",
+                    help="dir the DAgger collector writes scene_*.npz into")
+    ap.add_argument("--dagger-frac", type=float, default=0.5,
+                    help="fraction of each batch drawn from DAgger rollouts")
+    ap.add_argument("--dagger-reserve", type=int, default=20000,
+                    help="pre-allocated DAgger pair rows")
+    ap.add_argument("--dagger-min-vel", type=float, default=0.05,
+                    help="reject rollout states below this ||vel_si|| (sub-patch)")
+    ap.add_argument("--ingest-every", type=int, default=200,
+                    help="iters between scans of --dagger-dir")
+    ap.add_argument("--sync-path", default="",
+                    help="where to publish weights for the collector "
+                         "(default <out>_sync.pth when --dagger-dir is set)")
+    ap.add_argument("--sync-every", type=int, default=500,
+                    help="iters between weight publications (Fig. 3 'Synchronize "
+                         "Weights Periodically')")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     print(f"[load] {args.data}", flush=True)
-    net = build_model(K=CONFIG["K"], refine_layers=4, ctrl_dim=256).to(dev)
+    net = build_model(K=CONFIG["K"], refine_layers=4, ctrl_dim=256,
+                      fine_dim=args.fine_dim).to(dev)
+    CONFIG["fine_dim"] = args.fine_dim
 
     # Frozen-ViT feature cache, STREAMED to on-disk .npy memmaps.
     # The previous single-.pt cache could not scale: at 7115 pairs it held
@@ -100,7 +133,28 @@ def main():
             f"but {args.data} now has {n_scenes}. Delete it and rerun:\n    rm -rf {cache}")
     Fc = np.load(os.path.join(cache, "fc.npy"), mmap_mode="r")
     Fd = np.load(os.path.join(cache, "fd.npy"), mmap_mode="r")
+    # Raw images for the Fig. 2 fine CNN branch. A cache built before that branch
+    # existed has no ic.npy, and silently training without the branch would be the
+    # kind of quiet fidelity regression this repo has been bitten by before.
+    ic_p = os.path.join(cache, "ic.npy")
+    if args.fine_dim > 0 and not os.path.exists(ic_p):
+        raise SystemExit(
+            f"[feat] cache {cache} predates the fine-CNN branch (no ic.npy).\n"
+            f"    rm -rf {cache}    and rerun, or pass --fine-dim 0 for the "
+            f"coarse-only ablation.")
+    Ic = np.load(ic_p, mmap_mode="r") if args.fine_dim > 0 else None
+    Id = np.load(os.path.join(cache, "id.npy"), mmap_mode="r") if args.fine_dim > 0 else None
     vsi, tr, va = meta["vsi"], meta["tr"], meta["va"]
+    # Refuse a leaky (pair-level) split: it reports memorization as generalization.
+    _sid = meta.get("scene_id")
+    if _sid is not None and len(va):
+        _leak = len(set(_sid[va].tolist()) & set(_sid[tr].tolist())) / len(set(_sid[va].tolist()))
+        if _leak > 0.01:
+            raise SystemExit(
+                f"[feat] LEAKY CACHE: {100*_leak:.0f}% of val scenes also appear in "
+                f"train. This cache was built with the old pair-level split, whose "
+                f"val l_dir measures memorization (measured 0.038 seen vs 0.243 "
+                f"unseen on the same checkpoint).\n    rm -rf {cache}   and rerun.")
     # fd.npy has ONE row per scene (the desired view is shared by every pair in a
     # scene); scene_id maps pair -> scene. Saves ~16x on fd.
     scene_id = meta.get("scene_id")
@@ -116,6 +170,23 @@ def main():
         nn = vsi[tr].norm(dim=-1)
         print(f"[filter] remaining ||vel_si||: min {nn.min():.4f} median {nn.median():.3f}; "
               f"near-goal(<0.5) now {100*(nn < 0.5).float().mean():.1f}% of train", flush=True)
+
+    # ---- concurrent DAgger pool ----------------------------------------
+    pool = sync_path = None
+    if args.dagger_dir:
+        from cns.sim.dagger_pool import DaggerPool
+        H16, W16, C = Fc.shape[1], Fc.shape[2], Fc.shape[3]
+        H1, W1 = meta.get("img_shape", (512, 512, 3))[:2]
+        pool = DaggerPool(args.out.replace(".pth", "_dagger"), H16, W16, C,
+                          H1=H1, W1=W1, reserve_pairs=args.dagger_reserve,
+                          reserve_scenes=max(1, args.dagger_reserve // 5),
+                          min_vel=args.dagger_min_vel)
+        os.makedirs(args.dagger_dir, exist_ok=True)
+        sync_path = args.sync_path or args.out.replace(".pth", "_sync.pth")
+        print(f"[dagger] pool {pool.dir}: {pool.stats()}", flush=True)
+        print(f"[dagger] publishing weights to {sync_path} every "
+              f"{args.sync_every} iters; mixing {args.dagger_frac:.0%} of each batch",
+              flush=True)
 
     samp_w = None
     if args.balance:
@@ -149,14 +220,59 @@ def main():
         print(f"[resume] {cks[-1]} @ iter {start_it}", flush=True)
 
     def _take(arr, idx):
-        """Fc/Fd are numpy memmaps; fancy-indexing copies just the needed rows."""
+        """Fc/Fd/Ic/Id are numpy memmaps; fancy-indexing copies just the needed rows."""
         return torch.from_numpy(np.ascontiguousarray(arr[idx.cpu().numpy()]))
 
-    def batch_forward(idx):
-        fc = _take(Fc, idx).to(dev).float()
-        didx = idx if scene_id is None else scene_id[idx]
-        fd = _take(Fd, didx).to(dev).float()
-        return net.head_forward(fc, fd)
+    import contextlib
+    _amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.amp)
+
+    def amp_ctx():
+        if _amp_dtype is None or dev != "cuda":
+            return contextlib.nullcontext()
+        return torch.autocast("cuda", dtype=_amp_dtype)
+
+    # fp16 needs loss scaling; bf16 has fp32's exponent range and does not.
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.amp == "fp16"))
+
+    def _gather(fcA, fdA, icA, idA, sid, idx):
+        fc = _take(fcA, idx).to(dev).float()
+        didx = idx if sid is None else sid[idx]
+        fd = _take(fdA, didx).to(dev).float()
+        ic = idi = None
+        if icA is not None:
+            # [B,H,W,3] uint8 -> [B,3,H,W] float in [0,1], scaled on the GPU so the
+            # host->device copy moves a quarter of the bytes.
+            ic = _take(icA, idx).to(dev).permute(0, 3, 1, 2).float().div_(255.0)
+            idi = _take(idA, didx).to(dev).permute(0, 3, 1, 2).float().div_(255.0)
+        return fc, fd, ic, idi
+
+    def batch_forward(idx, didx_pool=None):
+        """idx indexes the uniform cache; didx_pool (optional) indexes the DAgger
+        pool. Both halves are concatenated into one forward so the batch statistics
+        (and the LayerNorms) see the mixed distribution, not alternating ones."""
+        parts = []
+        if len(idx):
+            parts.append(_gather(Fc, Fd, Ic, Id, scene_id, idx))
+        if didx_pool is not None and len(didx_pool):
+            parts.append(_gather(pool.fc, pool.fd,
+                                 pool.ic if Ic is not None else None,
+                                 pool.id, pool.scene_id, didx_pool))
+        if len(parts) == 1:
+            fc, fd, ic, idi = parts[0]
+        else:
+            fc = torch.cat([p[0] for p in parts])
+            fd = torch.cat([p[1] for p in parts])
+            ic = None if parts[0][2] is None else torch.cat([p[2] for p in parts])
+            idi = None if parts[0][3] is None else torch.cat([p[3] for p in parts])
+        return net.head_forward(fc, fd, Ic=ic, Id=idi)
+
+    def batch_targets(idx, didx_pool=None):
+        ts = []
+        if len(idx):
+            ts.append(vsi[idx])
+        if didx_pool is not None and len(didx_pool):
+            ts.append(pool.vsi[didx_pool])
+        return torch.cat(ts).to(dev)
 
     @torch.no_grad()
     def validate():
@@ -168,7 +284,9 @@ def main():
         acc, seen = {}, 0
         for i in range(0, len(va), args.val_batch):
             chunk = va[i:i + args.val_batch]
-            res, _ = net.objectives(batch_forward(chunk), vsi[chunk].to(dev), args.norm_weight)
+            with amp_ctx():
+                raw = batch_forward(chunk)
+            res, _ = net.objectives(raw, vsi[chunk].to(dev), args.norm_weight)
             for k, v in res.items():
                 acc[k] = acc.get(k, 0.0) + v * len(chunk)
             seen += len(chunk)
@@ -191,19 +309,52 @@ def main():
         best["l_dir"] = float(ck["best_l_dir"]); best["it"] = int(ck.get("best_it", -1))
         print(f"[resume] carrying best val l_dir {best['l_dir']:.4f} @ iter {best['it']}",
               flush=True)
-    print(f"[train] {args.iters} iters (from {start_it}), batch {args.batch}, fp32", flush=True)
+    print(f"[train] {args.iters} iters (from {start_it}), batch {args.batch}, "
+          f"amp={args.amp}, fine_dim={args.fine_dim}", flush=True)
+    if pool is not None and not os.path.exists(sync_path):
+        # The collector needs a policy before it can produce anything on-policy,
+        # so publish once up front rather than making it wait --sync-every iters.
+        torch.save({"state_dict": net.state_dict(), "config": CONFIG,
+                    "iters_done": start_it}, sync_path)
+        print(f"[dagger] published initial weights -> {sync_path}", flush=True)
+
     net.train(); t0 = time.time(); hist = []
     for it in range(start_it, args.iters):
+        # --- Fig. 3: ingest whatever the concurrent collector has produced ---
+        if pool is not None and (it + 1) % args.ingest_every == 0:
+            added = pool.ingest(args.dagger_dir, net.backbone, dev,
+                                prune_ingested=True)
+            if added:
+                print(f"  [dagger] +{added} pairs -> {pool.stats()}", flush=True)
+
+        # --- Fig. 3: publish weights for the collector to pick up ---
+        if pool is not None and (it + 1) % args.sync_every == 0:
+            tmp = sync_path + ".tmp"
+            torch.save({"state_dict": net.state_dict(), "config": CONFIG,
+                        "iters_done": it + 1}, tmp)
+            os.replace(tmp, sync_path)      # atomic: the collector may be reading
+
+        # DAgger share of the batch, capped by what the pool actually holds.
+        n_d = 0
+        if pool is not None and pool.n_pairs > 0:
+            n_d = min(int(round(args.batch * args.dagger_frac)), pool.n_pairs)
+        n_u = args.batch - n_d
         if samp_w is not None:
-            idx = tr[torch.multinomial(samp_w, args.batch, replacement=True)]
+            idx = tr[torch.multinomial(samp_w, n_u, replacement=True)] if n_u else tr[:0]
         else:
-            idx = tr[torch.randint(0, len(tr), (args.batch,))]
+            idx = tr[torch.randint(0, len(tr), (n_u,))] if n_u else tr[:0]
+        didx = (torch.randint(0, pool.n_pairs, (n_d,)) if n_d else None)
+
         opt.zero_grad(set_to_none=True)
-        raw = batch_forward(idx)
-        _, loss = net.objectives(raw, vsi[idx].to(dev), args.norm_weight)
-        loss.backward()
+        with amp_ctx():
+            raw = batch_forward(idx, didx)
+        # objectives() upcasts to fp32 internally, so the loss is computed in fp32
+        # regardless of the autocast dtype.
+        _, loss = net.objectives(raw, batch_targets(idx, didx), args.norm_weight)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
-        opt.step(); sched.step()
+        scaler.step(opt); scaler.update(); sched.step()
         hist.append(float(loss.detach()))
         if (it + 1) % args.log_every == 0:
             v = validate()

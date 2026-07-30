@@ -1,5 +1,5 @@
 """End-to-end test of the assembled CNSv2Net with the real frozen RADIO backbone.
-Reports peak VRAM at the canonical 512x512 to size the training batch on 8GB.
+Reports peak VRAM at the canonical 512x512 and the paper's batch 16.
     python3 tests/smoke_full_net.py
 """
 import sys, os
@@ -8,7 +8,7 @@ import torch
 from cns.models.cnsv2_net import build_model
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
-B, HW, K = 2, 512, 16
+B, HW, K = 16, 512, 16     # paper Sec. IV-A trains at batch 16
 net = build_model(K=K, refine_layers=4, ctrl_dim=256).to(dev)
 net.train()
 
@@ -24,8 +24,9 @@ vel_si = torch.randn(B, 6, device=dev)
 if dev == "cuda":
     torch.cuda.reset_peak_memory_stats()
 
-# mixed precision, as planned for the 8GB card
-with torch.autocast(device_type=dev, dtype=torch.float16, enabled=(dev == "cuda")):
+# bf16, not fp16: the feature correlation overflows fp16's 65504 range. Islands
+# in prob_match.py stay fp32 under either.
+with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
     raw = net(Ic, Id)
     vel = net.postprocess(raw, tPo)
     res, loss = net.objectives(raw, vel_si)
@@ -36,7 +37,13 @@ print("postprocessed vel:", tuple(vel.shape), "loss:", res)
 bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in net.backbone.parameters())
 tr_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in net.refine.parameters())
 print("grad flows to refine/controller:", tr_grad, "| backbone frozen (no grad):", not bb_grad)
+# The Fig. 2 CNN branch must actually receive gradient; if it is silently
+# disconnected the pixel-wise precision path contributes nothing.
+fine_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in net.fine.parameters())
+n_fine = sum(p.numel() for p in net.fine.parameters()) / 1e6
+print(f"fine CNN branch: {n_fine:.3f}M params, grad flows: {fine_grad}")
+assert fine_grad, "fine CNN branch received no gradient"
 if dev == "cuda":
-    print(f"PEAK VRAM (B={B}, 512x512, K={K}, fp16 fwd+bwd): "
+    print(f"PEAK VRAM (B={B}, 512x512, K={K}, bf16 fwd+bwd): "
           f"{torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
 print("RESULT: FULL NET OK")

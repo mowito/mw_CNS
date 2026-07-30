@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
 
-from cns.models.cnsv2_net import build_model
+from cns.models.cnsv2_net import build_model, build_from_checkpoint
 from cns.render.pybullet_scene import PyBulletScene
 
 
@@ -39,8 +39,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/cnsv2_smoke.pth")
     ap.add_argument("--episodes", type=int, default=20)
-    ap.add_argument("--max-steps", type=int, default=40)
-    ap.add_argument("--dt", type=float, default=0.15)
+    # PAPER VALUES. The paper runs dt = 1/50 s and 30 s episodes = 1500 control
+    # steps. The old defaults (dt 0.10-0.15, 40-80 steps) were driven purely by
+    # BlenderProc's 0.702 s/render, and Sec. 6.3 is blunt about the cost: 40 steps
+    # is ~38x less closed-loop integration than the paper, "a far bigger handicap
+    # than the patch size". Sub-mm final error comes from geometric decay over
+    # ~1500 steps, so a 40-step eval CANNOT reach Table I's TE 0.948 mm no matter
+    # how good the policy is. IsaacSim renders ~20x faster, so this is now
+    # affordable; episodes still exit early on convergence (~265 steps measured).
+    ap.add_argument("--max-steps", type=int, default=1500)
+    ap.add_argument("--dt", type=float, default=1.0 / 50.0)
     ap.add_argument("--te-thresh", type=float, default=0.005)   # 5 mm
     ap.add_argument("--re-thresh", type=float, default=1.0)     # 1 deg
     ap.add_argument("--oracle", action="store_true",
@@ -48,11 +56,14 @@ def main():
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    net = build_model(K=16, refine_layers=4, ctrl_dim=256).to(dev).eval()
     if os.path.exists(args.ckpt):
         ck = torch.load(args.ckpt, map_location=dev)
-        net.load_state_dict(ck["state_dict"]); print(f"loaded {args.ckpt}")
+        # Architecture comes from the checkpoint, not from hardcoded defaults --
+        # fine_dim is an architectural switch and must not be guessed.
+        net = build_from_checkpoint(ck, dev).eval()
+        print(f"loaded {args.ckpt}")
     else:
+        net = build_model(K=16, refine_layers=4, ctrl_dim=256).to(dev).eval()
         print(f"WARNING: {args.ckpt} not found -- evaluating an UNtrained model")
 
     sc = PyBulletScene(seed=123)

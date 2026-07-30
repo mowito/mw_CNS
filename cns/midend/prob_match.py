@@ -67,9 +67,15 @@ class ParticleToGrid(nn.Module):
         gc = (f - origin) / g                                # [N,N,2] fractional anchor coords
         base = torch.floor(gc[..., 0]).long(), torch.floor(gc[..., 1]).long()
 
+        # Offsets {-1,0,1} are EXACTLY the kernel support, not an approximation.
+        # With frac = gc - floor(gc) in [0,1), the kernel argument for offset o is
+        # frac - o - 0.5, so o=-1 -> [0.5,1.5), o=0 -> [-0.5,0.5), o=1 -> [-1.5,-0.5):
+        # all inside |a|<1.5. o=2 gives [-2.5,-1.5) and o=-2 gives [1.5,2.5), both
+        # identically zero under Eq. 17. Using (-1,0,1,2) per axis therefore did
+        # 16 scatter_adds per call where 9 suffice, in the hot path.
         idx_list, w_list = [], []
-        for oy in (-1, 0, 1, 2):
-            for ox in (-1, 0, 1, 2):
+        for oy in (-1, 0, 1):
+            for ox in (-1, 0, 1):
                 ax = base[0] + ox                            # [N,N] anchor x index
                 ay = base[1] + oy                            # [N,N] anchor y index
                 arg_x = gc[..., 0] - (ax.float() + 0.5)
@@ -111,36 +117,35 @@ class ParticleToGrid(nn.Module):
 class ProbMatch(nn.Module):
     """Full probabilistic matching: refined features -> (S, P, [explicit corr])."""
 
-    def __init__(self, K: int = 16):
+    def __init__(self, K: int = 16, eps: float = 1e-6):
         super().__init__()
-        self.p2g = ParticleToGrid(K=K)
+        self.p2g = ParticleToGrid(K=K, eps=eps)
         self.K = K
+        self.eps = eps
+
+    def _logits(self, Fc: torch.Tensor, Fd: torch.Tensor) -> torch.Tensor:
+        """F_bar_c . F_bar_d^T / sqrt(C), the shared term of Eq. 14 and Eq. 25.
+
+        Computed in fp32: the dot product over C=768 dims easily exceeds the fp16
+        range (65504) -> inf -> softmax=NaN. Keeping it fp32 makes both AMP
+        training and fp16 real-time inference numerically safe."""
+        B, H, W, C = Fc.shape
+        fc = Fc.reshape(B, H * W, C).float()
+        fd = Fd.reshape(B, H * W, C).float()
+        return torch.matmul(fc, fd.transpose(1, 2)) / (C ** 0.5)
 
     def score_matrix(self, Fc: torch.Tensor, Fd: torch.Tensor) -> torch.Tensor:
-        """Eq. 14. Fc,Fd: [B,H16,W16,C] -> S: [B,N,N] (softmax over desired).
-
-        Correlation is computed in fp32: the dot product over C=768 dims easily
-        exceeds the fp16 range (65504) -> inf -> softmax=NaN. Keeping it fp32
-        makes both AMP training and fp16 real-time inference numerically safe."""
-        B, H, W, C = Fc.shape
+        """Eq. 14. Fc,Fd: [B,H16,W16,C] -> S: [B,N,N] (softmax over desired)."""
         with torch.autocast(device_type=Fc.device.type, enabled=False):
-            fc = Fc.reshape(B, H * W, C).float()
-            fd = Fd.reshape(B, H * W, C).float()
-            logits = torch.matmul(fc, fd.transpose(1, 2)) / (C ** 0.5)
-            return torch.softmax(logits, dim=-1)
+            return torch.softmax(self._logits(Fc, Fd), dim=-1)
 
     def dual_softmax_conf(self, Fc: torch.Tensor, Fd: torch.Tensor) -> torch.Tensor:
         """Eq. 25 confidence C^i = sum_j S^{i,j}_{c->d} * S^{i,j}_{d->c}.  -> [B,N]
 
-        score_matrix() only returns S_{c->d} (softmax over the desired axis), so
-        the reverse direction is the softmax of the SAME logits over the current
-        axis. Recomputed here in fp32 for the same overflow reason.
-        """
-        B, H, W, C = Fc.shape
+        The reverse direction is the softmax of the SAME logits over the current
+        axis, so only one matmul is needed for both."""
         with torch.autocast(device_type=Fc.device.type, enabled=False):
-            fc = Fc.reshape(B, H * W, C).float()
-            fd = Fd.reshape(B, H * W, C).float()
-            logits = torch.matmul(fc, fd.transpose(1, 2)) / (C ** 0.5)
+            logits = self._logits(Fc, Fd)
             s_c2d = torch.softmax(logits, dim=-1)      # over desired patches j
             s_d2c = torch.softmax(logits, dim=-2)      # over current patches i
             return (s_c2d * s_d2c).sum(-1)             # [B,N]
@@ -159,12 +164,17 @@ class ProbMatch(nn.Module):
         Returns (cXg [B,2], dXg [B,2], conf [B,N]).
         """
         B, H, W, _ = Fc.shape
-        S = self.score_matrix(Fc, Fd)
-        conf = self.dual_softmax_conf(Fc, Fd)                     # [B,N]
-        grid = patch_grid_coords(H, W, Fc.device).float()          # [N,2]
+        # One matmul for both S and the dual-softmax confidence: this used to call
+        # score_matrix() and dual_softmax_conf() separately, so the [B,N,N] logits
+        # (N=1024 at 512x512) were built twice per call.
+        with torch.autocast(device_type=Fc.device.type, enabled=False):
+            logits = self._logits(Fc, Fd)
+            S = torch.softmax(logits, dim=-1)
+            conf = (S * torch.softmax(logits, dim=-2)).sum(-1)     # [B,N]
+        grid = patch_grid_coords(H, W, Fc.device).float()           # [N,2]
         matched = torch.matmul(S, grid)                            # [B,N,2] = x_c + F
         w = conf.unsqueeze(-1)                                     # [B,N,1]
-        den = w.sum(1).clamp_min(self.eps if hasattr(self, "eps") else 1e-6)
+        den = w.sum(1).clamp_min(self.eps)
         cXg = (w * grid.unsqueeze(0)).sum(1) / den
         dXg = (w * matched).sum(1) / den
         return cXg, dXg, conf

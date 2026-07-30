@@ -118,8 +118,17 @@ def build_feature_cache(scene_dir, net, device, out_dir, val_frac=0.1,
     25.6GB of redundancy and the cache (51.1GB) no longer fit the disk. Stored per
     scene it is 1.5GB, and training maps pair -> scene via meta["scene_id"].
 
+    IMAGES ARE CACHED TOO (uint8), because the Fig. 2 fine-grained CNN branch is
+    trainable and reads pixels, so unlike the frozen ViT features it cannot be
+    precomputed away. uint8 at 512x512x3 is 0.79MB per view -- CHEAPER than the
+    fp16 features it sits beside (32*32*768*2 = 1.57MB) -- and the desired view is
+    deduplicated per scene exactly as fd is. Storing float32 here instead would be
+    12.6GB per 4000-pair tensor and is what OOM-killed the old loader.
+
     Layout:  <out_dir>/fc.npy   float16 [N, H16,W16,C]   per PAIR
              <out_dir>/fd.npy   float16 [S, H16,W16,C]   per SCENE (deduped)
+             <out_dir>/ic.npy   uint8   [N, H, W, 3]     per PAIR
+             <out_dir>/id.npy   uint8   [S, H, W, 3]     per SCENE (deduped)
              <out_dir>/meta.pt  vel_si, tPo_norm, tr, va, n_scenes, scene_id
     """
     import os, glob as _g
@@ -151,10 +160,16 @@ def build_feature_cache(scene_dir, net, device, out_dir, val_frac=0.1,
     probe = net.backbone(torch.zeros(1, 3, 512, 512, device=device))
     _, H16, W16, C = probe.shape
     del probe
+    # Image resolution comes from the first scene rather than being assumed 512.
+    H1, W1 = np.load(files[0])["images"].shape[1:3]
     fc = np.lib.format.open_memmap(os.path.join(out_dir, "fc.npy"), mode="w+",
                                    dtype=np.float16, shape=(n, H16, W16, C))
     fd = np.lib.format.open_memmap(os.path.join(out_dir, "fd.npy"), mode="w+",
                                    dtype=np.float16, shape=(len(files), H16, W16, C))
+    ic = np.lib.format.open_memmap(os.path.join(out_dir, "ic.npy"), mode="w+",
+                                   dtype=np.uint8, shape=(n, H1, W1, 3))
+    idm = np.lib.format.open_memmap(os.path.join(out_dir, "id.npy"), mode="w+",
+                                    dtype=np.uint8, shape=(len(files), H1, W1, 3))
 
     # ---- pass 2: one scene at a time ----
     net.eval()
@@ -166,25 +181,47 @@ def build_feature_cache(scene_dir, net, device, out_dir, val_frac=0.1,
             fdes = net.backbone(des.float().div_(255.0)).to(torch.float16).cpu().numpy()[0]
             for k0 in range(0, len(rows), batch):
                 idx = rows[k0:k0 + batch]
-                cur = torch.from_numpy(imgs[1 + k0:1 + k0 + len(idx)])
+                raw = imgs[1 + k0:1 + k0 + len(idx)]
+                cur = torch.from_numpy(raw)
                 cur = cur.permute(0, 3, 1, 2).to(device).float().div_(255.0)
                 fcur = net.backbone(cur).to(torch.float16).cpu().numpy()
                 for j, r in enumerate(idx):
                     fc[r] = fcur[j]
+                    ic[r] = raw[j]                   # uint8 passthrough for the CNN branch
             fd[si] = fdes                            # one row per scene (deduped)
+            idm[si] = imgs[0]
             if (si + 1) % 100 == 0:
                 print(f"[feat]   {si+1}/{len(per_file)} scenes", flush=True)
-    fc.flush(); fd.flush()
+    fc.flush(); fd.flush(); ic.flush(); idm.flush()
 
-    nv = max(8, int(n * val_frac))
-    perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed))
+    # SPLIT BY SCENE, NOT BY PAIR. A pair-level random split leaks: every pair in
+    # a scene shares its desired view, objects, background, HDRI and exposure, so
+    # a "held-out" pair sits in a scene the model trained on. Measured on the
+    # first 40k run, which used a pair split: val l_dir 0.1878 looked like strong
+    # generalization, but the same checkpoint scored 0.038 on SEEN scenes and
+    # 0.243 on genuinely UNSEEN ones -- a 6.4x gap the val metric could not see,
+    # while closed loop diverged from 80mm on fresh scenes. The val number was
+    # measuring memorization.
+    g = torch.Generator().manual_seed(seed)
+    scene_perm = torch.randperm(len(files), generator=g)
+    n_val_scenes = max(1, int(round(len(files) * val_frac)))
+    val_scenes = set(scene_perm[:n_val_scenes].tolist())
+    sid_t = torch.tensor(scene_id, dtype=torch.long)
+    is_val = torch.tensor([int(s) in val_scenes for s in scene_id], dtype=torch.bool)
+    va = torch.nonzero(is_val, as_tuple=False).squeeze(-1)
+    tr = torch.nonzero(~is_val, as_tuple=False).squeeze(-1)
+    print(f"[feat] scene-disjoint split: {len(files)-n_val_scenes} train scenes "
+          f"({len(tr)} pairs) / {n_val_scenes} val scenes ({len(va)} pairs)", flush=True)
     torch.save({"vsi": torch.tensor(np.stack(vsis), dtype=torch.float32),
                 "tPo_norm": torch.tensor(np.array(tpos), dtype=torch.float32),
-                "tr": perm[nv:], "va": perm[:nv],
+                "tr": tr, "va": va,
                 "n_scenes": len(files), "shape": (n, H16, W16, C),
+                "img_shape": (H1, W1, 3),
                 "scene_id": torch.tensor(scene_id, dtype=torch.long)},
                os.path.join(out_dir, "meta.pt"))
-    print(f"[feat] cached -> {out_dir} ({n} pairs, {(n+len(files))*H16*W16*C*2/1e9:.1f}GB on disk; "
-          f"fd deduped {n}->{len(files)} rows)",
+    feat_gb = (n + len(files)) * H16 * W16 * C * 2 / 1e9
+    img_gb = (n + len(files)) * H1 * W1 * 3 / 1e9
+    print(f"[feat] cached -> {out_dir} ({n} pairs, {feat_gb:.1f}GB features + "
+          f"{img_gb:.1f}GB images; fd/id deduped {n}->{len(files)} rows)",
           flush=True)
     return n
