@@ -61,6 +61,18 @@ def main():
                          "with translation error up to this (metres)")
     ap.add_argument("--start-re", type=float, default=30.0,
                     help="rotation error cap (deg) when --start-te is set")
+    # Near-goal quota, for COLLECTION rather than basin characterization. Keep at 0
+    # for evaluation -- gate 6 must sample the paper's full initial distribution.
+    ap.add_argument("--near-frac", type=float, default=0.0,
+                    help="fraction of episodes started NEAR the goal (see Sec. 6.22: "
+                         "fixing beta removed the near-goal coverage the broken "
+                         "beta=1.0 supplied by accident, and neither half of the "
+                         "database now teaches sub-20mm convergence). 0 = off.")
+    ap.add_argument("--near-te", type=float, default=0.05,
+                    help="translation cap (m) for --near-frac episodes; 0.05 spans "
+                         "the 5-50mm band the closed loop stalls in")
+    ap.add_argument("--near-re", type=float, default=5.0,
+                    help="rotation cap (deg) for --near-frac episodes")
     args = ap.parse_args()
 
     from cns.render.isaac_scene import launch
@@ -96,11 +108,25 @@ def main():
         # previously cost hours chasing a policy bug that was a renderer mismatch.
         if not args.no_auto_expose:
             gen.auto_expose(tar, rng)
+        # --near-frac seeds a fraction of episodes CLOSE to the goal instead of from
+        # the full CNS-v1 initial distribution. Fixing the beta schedule removed the
+        # near-goal coverage the broken beta=1.0 had been supplying by accident: an
+        # expert-driven rollout converges to 2 mm, but a policy-driven one bottoms
+        # out at a measured median 65.9 mm, and the uniform half is far-heavy. So
+        # NOTHING in the database teaches the last two orders of magnitude, which is
+        # exactly what the 0.948 mm gate needs (Sec. 6.22). Seeding the start pose is
+        # the direct fix -- it does not depend on rollouts happening to arrive there.
         if args.start_te > 0:
             cur0, _te0, _re0 = perturb_pose(tar, rng, te_min=args.start_te * 0.3,
                                             te_max=args.start_te,
                                             re_min=args.start_re * 0.3,
                                             re_max=args.start_re)
+        elif args.near_frac > 0 and rng.uniform() < args.near_frac:
+            cur0, _te0, _re0 = perturb_pose(tar, rng,
+                                            te_min=args.near_te * 0.1,
+                                            te_max=args.near_te,
+                                            re_min=args.near_re * 0.1,
+                                            re_max=args.near_re)
         else:
             cur0 = sample_initial(rng, gen.scene_center)
         desired = render_pose(tar)

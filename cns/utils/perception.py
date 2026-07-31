@@ -290,3 +290,33 @@ if __name__ == "__main__":
 
     print(pc)
     print("center = {}".format(pc[H//2, W//2]))
+
+
+def in_frame_fraction(wcT, wP, fx=512.0, fy=512.0, cx=256.0, cy=256.0, W=512, H=512):
+    """Fraction of world points wP that project inside the image from camera wcT.
+
+    The pipeline had NO out-of-view test. `collect_dagger._gravity_patch` returning
+    None was the only signal, and `--drive pbvs` (now the default) returns before
+    ever calling it, so nothing noticed an episode staring at empty floor.
+
+    A translation-error guard cannot substitute. TE = ||t|| of inv(tar) @ cur, so
+    rotating the camera IN PLACE leaves TE at exactly 0 while the scene leaves the
+    frame: measured 0 mm TE / 0.00 in-frame at 45 deg of yaw. An episode can sit at
+    TE 50 mm with RE 170 deg, look away from everything, and spend its whole step
+    budget saving blank images that the pose label still describes perfectly.
+
+    wcT is OpenCV cam-to-world (+z toward the scene); points behind the camera are
+    counted as out of frame.
+    """
+    import numpy as np
+    wP = np.asarray(wP, float).reshape(-1, 3)
+    Rw, t = np.asarray(wcT, float)[:3, :3], np.asarray(wcT, float)[:3, 3]
+    pc = (wP - t) @ Rw
+    z = pc[:, 2]
+    ok = z > 1e-6
+    if not ok.any():
+        return 0.0
+    u = fx * pc[ok, 0] / z[ok] + cx
+    v = fy * pc[ok, 1] / z[ok] + cy
+    inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    return float(inside.sum()) / float(len(wP))

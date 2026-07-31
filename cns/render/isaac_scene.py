@@ -92,6 +92,21 @@ class IsaacSceneGen:
         self.k = k
         self.rt_subframes = rt_subframes
 
+        # Asset paths MUST be absolute. Each converted model USD points at its own
+        # texture with the RELATIVE path './materials/textures/texture.png'. Add a
+        # relative reference and Omniverse's UsdToMdl translation has no absolute
+        # layer identifier to resolve that against, so it silently falls back to a
+        # blank material and every object renders as an untextured matte blob:
+        #   [Error] [omni.rtx.materials] [UsdToMdl] Prim '/World/objects/obj_2/...'
+        #   parameter 'diffuse_texture': References an asset that can not be found:
+        #   './materials/textures/texture.png'
+        # The pose/label/histogram checks all pass -- see Sec. 6.19 for how much
+        # this cost. `--usd data/gso_usd` (relative) is what every launcher passes,
+        # so normalizing here rather than at the call sites is the fix.
+        usd_dir = os.path.abspath(usd_dir)
+        hdri_dir = os.path.abspath(hdri_dir) if hdri_dir else hdri_dir
+        tex_dir = os.path.abspath(tex_dir) if tex_dir else tex_dir
+
         # convert_gso_to_usd.py writes <usd_dir>/<name>/<name>.usd -- one directory
         # per model, so each keeps its own materials/textures/texture.png. The flat
         # layout is also accepted for older conversions, but warned about, because
@@ -109,6 +124,25 @@ class IsaacSceneGen:
             self.models = flat
         if not self.models:
             raise SystemExit(f"no *.usd under {usd_dir} -- run scripts/convert_gso_to_usd.py")
+        assert all(os.path.isabs(m) for m in self.models), \
+            "model paths must be absolute or object textures will not resolve"
+
+        # Every object rendering untextured is invisible to the pose, label and
+        # brightness checks, so verify the textures the USDs point at are actually
+        # reachable. Sampled rather than exhaustive: 944 stats per process startup
+        # is pointless when the failure mode is all-or-nothing.
+        probe = self.models[::max(1, len(self.models) // 20)][:20]
+        missing = [m for m in probe
+                   if not glob.glob(os.path.join(os.path.dirname(m),
+                                                 "materials", "textures", "*"))]
+        if missing:
+            raise SystemExit(
+                f"[isaac] {len(missing)}/{len(probe)} sampled models have no "
+                f"materials/textures/* next to their .usd, e.g.\n"
+                f"    {missing[0]}\n"
+                f"Objects would render as untextured matte blobs and every "
+                f"pose/label/histogram check would still pass (Sec. 6.19). "
+                f"Re-run scripts/convert_gso_to_usd.py.")
         self.hdris = sorted(glob.glob(os.path.join(hdri_dir, "*.hdr"))) if hdri_dir else []
         self.texes = []
         if tex_dir:

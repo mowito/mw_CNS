@@ -18,7 +18,16 @@ from cns.sim.cnsv2_data import (load_bproc_samples, precompute_backbone_features
                                 build_feature_cache)
 
 CONFIG = {"K": 16, "feat_dim": 768, "intrinsic": {"fx": 512, "fy": 512, "cx": 256,
-          "cy": 256, "H1": 512, "W1": 512}, "d_star": 1.0}
+          "cy": 256, "H1": 512, "W1": 512},
+          # NOT a runtime value -- nothing reads it. The paper's Table I env uses
+          # d* = 1.0 m, but our sampler draws r in [0.5, 0.9] (CNS-v1 values), so the
+          # d* actually baked into labels is per-scene: measured 0.503-0.940 m,
+          # median 0.721. Recorded honestly because a deployment consumer reading
+          # config["d_star"] and getting 1.0 would mis-scale every translation by up
+          # to 2x. The real scale is computed per scene as ||tPo|| at the desired pose.
+          "d_star_paper": 1.0,
+          "d_star_sampled_range": [0.5, 0.9],
+          "d_star_note": "computed per-scene at runtime; see cns/sim/supervisor.py"}
 
 
 def main():
@@ -91,10 +100,27 @@ def main():
                     help="dir the DAgger collector writes scene_*.npz into")
     ap.add_argument("--dagger-frac", type=float, default=0.5,
                     help="fraction of each batch drawn from DAgger rollouts")
+    ap.add_argument("--init", default="",
+                    help="warm-start weights from this checkpoint (state_dict only; "
+                         "optimizer, LR schedule and iteration counter start fresh). "
+                         "Ignored if <out>_iter*.pth exist, so a resume always wins.")
+    ap.add_argument("--feat-cache", default="",
+                    help="reuse an existing uniform-half feature cache DIRECTORY "
+                         "instead of <out>_feat. The cache depends only on --data, "
+                         "so a second run should share it rather than spend ~20 min "
+                         "and 39GB rebuilding an identical one.")
     ap.add_argument("--dagger-reserve", type=int, default=20000,
                     help="pre-allocated DAgger pair rows")
-    ap.add_argument("--dagger-min-vel", type=float, default=0.05,
-                    help="reject rollout states below this ||vel_si|| (sub-patch)")
+    ap.add_argument("--dagger-min-tv", type=float, default=0.015,
+                    help="DAgger pool floor on TRANSLATION (unit-world). A pair is "
+                         "dropped only if translation AND rotation are both below "
+                         "their floors -- the old single --dagger-min-vel on the "
+                         "mixed 6-vector norm cut 81%% of sub-20mm pairs, keeping "
+                         "the ones with rotation and discarding aligned-but-offset "
+                         "ones (Sec. 6.22). Default = half a 16px patch.")
+    ap.add_argument("--dagger-min-rw", type=float, default=0.012,
+                    help="DAgger pool floor on ROTATION (rad); half a patch of "
+                         "image motion at the canonical intrinsics.")
     ap.add_argument("--ingest-every", type=int, default=200,
                     help="iters between scans of --dagger-dir")
     ap.add_argument("--sync-path", default="",
@@ -118,7 +144,11 @@ def main():
     # OOM-killed (exit 137) on this 31GB box, and torch.save() additionally needs
     # every byte resident to serialise. build_feature_cache() streams one scene at
     # a time (peak ~64MB) and training then demand-pages 8 rows per step.
-    cache = args.out.replace(".pth", "_feat")          # a DIRECTORY now
+    # Derived from --out by default, but overridable: the uniform half of the
+    # database has nothing to do with which run is training on it, and rebuilding
+    # it costs ~20 min and 39GB. A second run with a different --out would
+    # otherwise silently rebuild an identical cache.
+    cache = args.feat_cache or args.out.replace(".pth", "_feat")   # a DIRECTORY
     import glob as _g
     n_scenes = len(_g.glob(os.path.join(args.data, "scene_*.npz")))
     meta_p = os.path.join(cache, "meta.pt")
@@ -180,7 +210,8 @@ def main():
         pool = DaggerPool(args.out.replace(".pth", "_dagger"), H16, W16, C,
                           H1=H1, W1=W1, reserve_pairs=args.dagger_reserve,
                           reserve_scenes=max(1, args.dagger_reserve // 5),
-                          min_vel=args.dagger_min_vel)
+                          min_tv=args.dagger_min_tv,
+                          min_rw=args.dagger_min_rw)
         os.makedirs(args.dagger_dir, exist_ok=True)
         sync_path = args.sync_path or args.out.replace(".pth", "_sync.pth")
         print(f"[dagger] pool {pool.dir}: {pool.stats()}", flush=True)
@@ -218,6 +249,37 @@ def main():
         if "sched" in ck: sched.load_state_dict(ck["sched"])
         start_it = ck.get("iters_done", 0)
         print(f"[resume] {cks[-1]} @ iter {start_it}", flush=True)
+    elif args.init:
+        # WARM START, not a resume: weights only, so the LR schedule, optimizer
+        # state and iteration counter all begin fresh. This is what a DAgger round 2
+        # wants -- carry the policy forward so its rollouts are meaningful, but
+        # train on a new database from iteration 0. Deliberately in the `elif`: a
+        # real resume checkpoint must always win over --init, or a restarted job
+        # would silently throw away its own progress.
+        ick = torch.load(args.init, map_location=dev)
+        # NON-STRICT, and it REPORTS. Adding RoPE to the controller renamed its
+        # self-attention parameters (nn.MultiheadAttention in_proj/out_proj ->
+        # MHAttention q/k/v/proj), so a strict load would just crash and a silent
+        # non-strict load would hide that the whole controller had been re-initialized.
+        # Print it, and refuse if almost nothing matched -- that means the wrong
+        # checkpoint, not an intended architecture change.
+        missing, unexpected = net.load_state_dict(ick["state_dict"], strict=False)
+        own = set(net.state_dict().keys())
+        loaded = len(own) - len(missing)
+        print(f"[init] warm-started from {args.init} "
+              f"(trained {ick.get('iters_done')} iters): {loaded}/{len(own)} tensors "
+              f"loaded, {len(missing)} re-initialized, {len(unexpected)} unused",
+              flush=True)
+        if missing:
+            groups = sorted({k.split(".")[0] + "." + k.split(".")[1]
+                             for k in missing if "." in k})
+            print(f"[init] RE-INITIALIZED (fresh weights): {', '.join(groups[:8])}"
+                  + (" ..." if len(groups) > 8 else ""), flush=True)
+        if loaded < 0.5 * len(own):
+            raise SystemExit(
+                f"[init] REFUSING: only {loaded}/{len(own)} tensors matched. That is "
+                f"a checkpoint/architecture mismatch, not a warm start.")
+        print(f"[init] optimizer/schedule/iter counter start fresh", flush=True)
 
     def _take(arr, idx):
         """Fc/Fd/Ic/Id are numpy memmaps; fancy-indexing copies just the needed rows."""

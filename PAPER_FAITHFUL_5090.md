@@ -367,6 +367,14 @@ the gap DAgger is supposed to fill — which is why doing DAgger *properly* (§4
 matters more than any other single change. Harness is proven correct (oracle 100%,
 ratio 0.003).
 
+> **2026-07-30: THAT HYPOTHESIS HAS NOW BEEN TESTED AND IS NOT SUFFICIENT.** Fig. 3
+> concurrent DAgger ran correctly end to end — ring evicting, 727 scenes cycled,
+> 66.5% of the DAgger half near-goal, offline val l_dir 0.2456 -> **0.1993** on a
+> scene-disjoint split. Gate 6 on that checkpoint: **SR 0/20**, median final TE
+> **426 mm**, median TE ratio 0.667 (`logs/eval_gate6.log`, §6.17). Doing DAgger
+> properly moved the offline number and did not move closed loop off zero. Do not
+> spend more effort on the DAgger half expecting it to close this.
+
 ---
 
 ## 9. Open questions to resolve on the 5090
@@ -516,3 +524,477 @@ suspects were eliminated by measurement before the real one:
 Also: `--patience` and best-checkpoint tracking were both keyed to the leaky
 metric, so "best" was selected on memorization. Re-run before trusting any
 checkpoint selected this way.
+
+### 6.16 THE DAGGER POOL SEALED ITSELF 800 ITERS IN — Fig. 3 silently became phase 2
+`DaggerPool.ingest()` checked a `full()` high-water mark and `break`ed, with no
+eviction. The reserve is not a limit to stop at, it is a **ring**. On the first
+concurrent run (2026-07-30):
+
+```
+iter 800:  [dagger] +1815 pairs -> 8000 pairs / 249 scenes
+           [dagger] pool FULL (8000/8000 pairs, 249/1600 scenes); stopping ingest
+...every ingest for the remaining 39200 iters was a no-op.
+```
+
+`--dagger-reserve 8000` against ~32 pairs/scene binds at 249 scenes, so the pool
+sealed four minutes into a two-hour run. Nothing announced itself as broken:
+weight syncs kept publishing, collectors kept reloading (39 times), the
+beta 1.0→0.3 schedule kept advancing, and 923 fresh scenes / 16 GB accumulated in
+`data/dagger_live` — while 35% of every batch was drawn from the *same 249 scenes
+produced by an 800-iter-old policy*. That is exactly the phase-2 algorithm §6.12
+exists to replace, wearing Fig. 3's process layout. Both collectors and both
+Isaac servers burned a GPU each for output nothing read.
+
+**Why the symptom is easy to misread:** the loss curve looks healthy. The
+aborted run reached best val l_dir **0.2456 @ iter 20200** on the scene-disjoint
+split and was still improving. There is no offline metric that reports "your
+on-policy data stopped arriving" — only the grep for `pool FULL`.
+
+Fixed: eviction is FIFO over whole **scenes**, oldest first
+(`_evict_scene`/`_alloc_scene`). By scene and not by pair because pairs address
+their goal image indirectly via `scene_id` into `fd`/`id` — recycling a scene slot
+under a live pair silently repoints that pair at a different scene's goal, a
+corrupt label with no symptom but a worse number. `tests/test_dagger_pool_evict.py`
+stamps every synthetic scene with a unique pixel value and asserts
+`ic[r] == id[scene_id[r]]` for every live row, so that class of corruption fails
+the test instead of the run. Verified by mutation: dropping the pair-invalidation
+half of `_evict_scene` makes the test fail.
+
+Two consequences for callers:
+- Live pair rows are **no longer the prefix `[0, n_pairs)`**. Sample through
+  `pool.sample(n)`; `randint(0, pool.n_pairs)` now draws dead slots.
+- `meta.pt` stores a validity mask (`pair_valid`, `scene_seq`, `seq`). Old
+  prefix-format meta still loads and is widened into the slot layout.
+
+**Result of the re-run with the ring (2026-07-30, 40k iters, 1.96 h):**
+
+| run | pool | best val l_dir (scene-disjoint) |
+|---|---|---|
+| leaky-split run | frozen | 0.1878 — **invalid**, §6.15; 0.243 on unseen scenes |
+| aborted static run | frozen at iter 800 | 0.2456 @ 20200 (killed at 21800) |
+| **ring run** | **evicting, 727 scenes cycled** | **0.1993 @ 37800** |
+
+The ring run's 0.1993 is measured on held-out scenes, so it beats the leaky
+checkpoint's *unseen-scene* number (0.243) outright: the model now generalizes
+better than the memorizing one did on fresh scenes. Pool health over the run —
+200 ingests, **zero** `pool FULL`, steady at ~7995/8000 pairs / 260 scenes, ring
+turned over 2.8x, and near-goal held at **66.5%** with no drift, i.e. §6.12's
+pile-up did not recur. 17057 pairs rejected below `min_vel`.
+
+Caveat on attributing the gain: one run each, no seed control, and the two runs
+also differ in that the aborted one had a full pool from iter 800 while the ring
+run grew from empty. But a frozen pool plausibly *hurts* offline l_dir and not
+just closed loop — 5-6 of every 16 samples drawn from a fixed 249 scenes for 20k
+iters revisits each of those pairs ~14 times per 1000 iters. Gate 6's closed-loop
+TE ratio is still the number that decides it.
+
+Also fixed alongside: `scripts/run_concurrent_dagger.sh` invoked bare `python`,
+which resolves only inside an activated `cnsv2` env. Launched detached it failed
+with `python: command not found` — *after* four minutes of IsaacSim startup,
+because the two render servers spawn before the trainer. The interpreter is now
+`PYTHON=${PYTHON:-python}`, checked (including `import torch`) before anything is
+spawned. And the `cleanup` trap only sent TERM, which the kit python behind
+`python.sh` ignores — every run so far left two render servers alive after the
+trainer exited, each holding GPU memory and ~300 W until spotted by hand. It now
+escalates to KILL (children included) and sweeps by cmdline, since the servers are
+grandchildren via `python.sh` and a PID-only sweep misses them.
+
+### 6.17 GATE 6 ON THE FIRST HONEST CHECKPOINT — SR 0/20, and the failure is bimodal
+`checkpoints/cnsv2.pth` (val l_dir 0.1993 @ iter 37800, scene-disjoint split, DAgger
+ring healthy), evaluated with the row-1 protocol — `--deploy hybrid --max-steps 1500
+--te-thresh 0.0005 --re-thresh 0.05`, 20 episodes, server seed left at the default so
+the episodes are PAIRED with the oracle gate on identical scenes and initial poses:
+
+| | Table I row 1 | measured |
+|---|---|---|
+| SR | 20/20 | **0/20** |
+| final TE | 0.948 ± 0.606 mm | median **426 mm** |
+| final RE | 0.075 ± 0.048 deg | median **42.2 deg** |
+| median TE ratio | — | 0.667 |
+
+The oracle solved these same scenes at SR 100% / ratio 0.008 the same day, so the
+harness is not implicated.
+
+**The failure splits cleanly in two**, which the median hides:
+- **9/20 diverge** (ratio > 1), several to tens of metres. There is no velocity clamp
+  and no workspace bound — `integrate()` runs 1500 steps x dt=1/50 = 30 s, so a
+  sustained wrong-direction velocity of ~1.8 m/s ends 53 m away. For these episodes
+  the final-TE *magnitude* is meaningless, only "diverged" is. Report medians and SR,
+  never mean±std, or one runaway dominates the statistic.
+- **11/20 make real progress and stall**: median ratio 0.345, best 0.077
+  (495.6 -> 38.4 mm). Real closed-loop convergence, three orders of magnitude short
+  of the 0.948 mm target.
+
+**Counter-intuitive, and it kills the obvious far-field story:** the episodes that
+diverge start *closer*, not further. Over the full 20: diverged median initial TE
+**497 mm** vs **566 mm** for the ones that progress, initial RE **62.9** vs
+**113.8 deg**, Spearman(initial TE, ratio) = **-0.33** (it was -0.47 at n=15, so treat
+the magnitude as soft — the sign is the robust part). The row-7 run reproduces the
+same inversion independently (-0.57), so this is a property of the POLICY, not of the
+hybrid wrapper. Whatever is wrong is not simply "the far field is weak".
+
+**Open lead, cheap to test.** The row-1 switch fires while
+`||cXg - dXg|| > 0.1*sqrt(N16)`, so a run ending 37 m out should sit in hybrid mode
+almost throughout. It does not: ep 7 ends at 37321 mm having spent only 410/1500
+steps there, i.e. the criterion called it near-goal for **73%** of the episode. Same
+for ep 8 (52%) and ep 11 (61%). Note this is the OPPOSITE direction from the failure
+already recorded in `hybrid_control.py` (ep2 spending 1493/1500 steps in hybrid mode
+because matching never recovered) — there the criterion correctly reported "far", here
+it reports "near" while the pose error is tens of metres. Either the gravity centres
+collapse once the objects leave the field of view, or they are mis-scaled and the
+threshold is meaningless — which would connect to `scripts/probe_gravity.py`'s 3-5
+patch offsets in every bin. Log `||cXg - dXg||` against true TE for one diverging
+episode; no retraining needed.
+
+**Next diagnostic, not yet run:** the same 20 paired scenes with `--deploy pbvs`
+(row 7, raw policy every step). That separates "the policy's velocity is bad" from
+"the hybrid wrapper amplifies a mediocre policy into a runaway". Until that is run,
+attributing the divergences to either the model or the control law is guesswork.
+
+### 6.18 ROW 7 ABLATION — the deployment law is NOT the culprit; the policy is
+Same checkpoint, same 20 PAIRED scenes and initial poses, only `--deploy` changed
+(`logs/eval_row7.log` vs `logs/eval_gate6.log`):
+
+| | row 1 (hybrid) | row 7 (raw policy) | paper's row 7 |
+|---|---|---|---|
+| SR | 0/20 | **0/20** | 18/20 |
+| diverged (ratio>1) | 9/20 | **10/20** | — |
+| median TE ratio | 0.667 | 1.883 (see caveat) | — |
+| median final TE | 426 mm | 950 mm | — |
+| four best final TE | 38 / 58 / 60 / 88 mm | 72 / 154 / 200 / 207 mm | — |
+
+**The divergence rate is unchanged (9/20 vs 10/20), so the hybrid wrapper neither
+causes nor prevents the runaways.** It changes WHICH episodes fail, not whether:
+ep 0 and ep 7 are catastrophic under row 1 (7.8x, 122x) and fine under row 7
+(0.84, 0.70); ep 9 and ep 16 are the reverse (0.10 -> 5.9, 0.08 -> 35.4).
+Head-to-head over 20: row 1 better on 6, row 7 better on 8, comparable on 6 — no
+reliable advantage either way. Row 1 does reach better BEST cases, so when the
+switch helps it helps, but it is close to a coin flip per episode.
+
+The conclusion that matters: **the policy's velocity output is itself unreliable, and
+the deployment law is not what is standing between this checkpoint and Table I.**
+Row 7 removes the control law entirely and still scores 0/20 against the paper's
+18/20. Stop suspecting Eq. 24 / the switch; the §6.17 `||cXg-dXg||` lead explains at
+most which of the two failure paths a given episode takes.
+
+**Methodological caveat — the median is unstable on a bimodal split.** Row 7's ratios
+split 10 below 1.0 and 10 above, so its "median 1.883" is the mean of the 10th and
+11th sorted values (0.835 and 2.931) and describes NO actual episode. Row 1's median
+sits inside its partial band and is meaningful. §6.17 says report medians and SR
+rather than mean±std; add to that: when the outcome is bimodal and the split is near
+50/50, report the DIVERGENCE COUNT as the primary statistic, since the median can
+swing by 2x on one episode crossing 1.0.
+
+### 6.19 A RELATIVE `--usd` PATH SILENTLY STRIPPED EVERY OBJECT TEXTURE — root-caused and FIXED
+Found by `scripts/view_scenes.py`, exactly the way §6.11 was found, and invisible to
+every statistic that was being watched.
+
+**Observation (confirmed, 8 random scenes / 24 images + native-resolution crops):**
+objects rendered through `cns/render/isaac_eval_server.py` carry **no albedo texture**
+— plain matte white/pale-blue/beige solids with shading only. The same objects through
+the `isaac_scene.py` generator are fully textured (Reebok logos, legible "Connect 4
+Launchers" box art, printed nutrition panels). **Backgrounds are textured in BOTH.**
+That asymmetry is the clue: the ground material is built explicitly in code
+(`_make_textured_material`), while object materials arrive via
+`prim.GetReferences().AddReference(model)` (`isaac_scene.py:262`) from the USD.
+
+**Ruled out:**
+- *Texture streaming / warm-up.* `scene_0000.npz` — the very first scene the generator
+  ever wrote — is fully textured, so it is not a cache-warming effect.
+- *Exposure.* Both paths call `auto_expose`. DAgger is mildly brighter (mean luminance
+  158 vs 136 / 255) with only 0.69% clipped pixels — nowhere near enough to erase
+  texture across whole objects.
+- *Different asset dir.* Both are passed `--usd data/gso_usd`, and the §6.11 guard
+  hard-errors on the flat layout.
+- *Saturation as a detector.* DAgger whole-image saturation is 0.247 vs 0.290 — the
+  textured BACKGROUND carries the colour, so this statistic does not see the problem.
+  Object-pixel statistics would, but the collector saves no `masks` key.
+
+**ROOT CAUSE (confirmed by `scripts/probe_albedo.py`).** Every launcher passes
+`--usd data/gso_usd` — a RELATIVE path. `IsaacSceneGen` globbed it as-is, so
+`prim.GetReferences().AddReference(model)` authored a relative reference, leaving the
+referenced layer without an absolute identifier. Each converted model USD points at
+its texture with the relative path `./materials/textures/texture.png`, and Omniverse's
+USD->MDL translation then has nothing to resolve it against:
+
+```
+[Error] [omni.rtx.materials] [UsdToMdl] Prim '/World/objects/obj_2/Looks/material_0/material_0'
+parameter 'diffuse_texture': References an asset that can not be found: './materials/textures/texture.png'
+```
+
+It falls back to a blank material rather than failing. `data/isaac_train` escaped only
+because that generator run happened to be invoked with an absolute path.
+
+**FIX:** `IsaacSceneGen.__init__` now `abspath`s `usd_dir`/`hdri_dir`/`tex_dir`,
+asserts every model path is absolute, and samples 20 models at startup to confirm
+`materials/textures/*` is reachable — erroring with a pointer to this section rather
+than rendering blanks. Normalizing inside the class covers all four construction
+sites (`isaac_scene`, `isaac_eval_server`, `bench_isaac`, `probe_albedo`).
+
+**Verified:** same scene, same models, same lighting, relative `--usd` both times —
+texture-resolution errors 6 -> **0**, mean saturation 0.2574 -> **0.4770**, and the
+render goes from three white blobs to a green felt basket with visible fibre, a
+legible "SCIENCE" game box and a shoe sole with its label.
+
+**Both earlier hypotheses were wrong**, and the probe is what killed them: +120 settle
+frames changed the image by 2.15/255 and attaching `instance_segmentation` by 0.41/255.
+Neither settle time nor `want_masks` had anything to do with it.
+
+**WHAT THIS INVALIDATES.** The collectors and the closed-loop eval share this renderer,
+so:
+- **`checkpoints/cnsv2.pth` (val l_dir 0.1993) must be retrained.** 35% of every batch
+  (the DAgger half) was untextured objects; the uniform 65% was textured.
+- **§6.17 gate 6 (SR 0/20) and §6.18 (row 7, SR 0/20) are both void.** 100% of that
+  evaluation ran on untextured objects — off-distribution from the majority of
+  training. A method whose entire mechanism is *probabilistic correspondence* was
+  asked to match matte blobs with no appearance signal to correspond WITH.
+- §6.18's conclusion "the policy is the problem, not the deployment law" does not
+  survive either; it compared two control laws over the same broken renders.
+
+This is the third time an eval/train renderer mismatch has produced a confident wrong
+conclusion here — §6.15 step 3 (`auto_expose`), §6.11 (shared texture), now this. The
+pattern: pose, label and brightness statistics all pass, because none of them look at
+whether the OBJECTS carry appearance. **Run `scripts/view_scenes.py` on the collector
+output before trusting any closed-loop number**, and prefer object-pixel statistics
+over whole-image ones — whole-image saturation was 0.247 vs 0.290 here, which looks
+fine, because the textured BACKGROUND carries the colour.
+
+### 6.20 THE BETA SCHEDULE WAS SILENTLY DISABLED TWICE, BY TWO DIFFERENT BUGS
+DAgger's whole premise is that the expert share falls so the database ends up
+holding states the POLICY visits. That schedule failed to run twice, each time
+silently, each time leaving a plausible-looking log.
+
+**Bug 1 -- the annealing horizon was the "unbounded" sentinel.**
+`collect_dagger.py` annealed over `--episodes`, and every launcher passes
+`--episodes 100000` to mean "run until training ends". At ~500 episodes actually
+completed, `frac = 500/100000 = 0.005`, so beta went 1.000 -> 0.997 and the logs
+printed `beta 1.00` for every episode of two entire 40k runs. **No DAgger data was
+ever on-policy**; both runs were behavioural cloning on expert trajectories, which
+is the phase-2 algorithm Sec. 6.12 exists to replace, reached by a third route.
+Fixed: beta now anneals on `iters_done` read from the synced checkpoint
+(`--beta-iters`, set to the trainer's `--iters`), so the schedule tracks TRAINING
+progress and is independent of collector throughput. A guard now REFUSES to start
+when `--beta-final` is given without an explicit horizon.
+
+**Bug 2 -- `${VAR:-default}` treats empty as unset.** The fix for bug 1 added
+`BETA_FINAL=${BETA_FINAL:-0.3}` to `run_concurrent_dagger.sh`. Passing
+`BETA_FINAL=""` to mean "no annealing" therefore re-enabled it at 0.3, and an
+intended constant-beta=0 round instead ran beta annealing 0 -> 0.30 with the expert
+share RISING. Compounding it, the sync checkpoint was pre-seeded from a previous
+run whose `iters_done` was 32200, so the collector's first beta read 0.24 until the
+trainer's first publish. Fixed: `${BETA_FINAL-0.3}` (no colon), a `none` sentinel,
+the seeded checkpoint's `iters_done` zeroed, and the launcher now ECHOES the
+resolved rollout config:
+`[run] rollout: drive=pbvs beta=0.0 beta_final=<none> iters=40000`.
+
+**The lesson both share:** a schedule that silently does nothing looks exactly like
+a schedule that ran. `beta 1.00` forever and `beta 0.00 -> 0.30` are both
+well-formed log output. Verify the schedule MOVED before trusting a run --
+`grep -oE 'beta [0-9.]+' logs/collect_0.log | sort -u` is the whole check, and it
+now appears in the queue scripts.
+
+### 6.21 A LOG-SPACE MAGNITUDE BLOW-UP CAN END AN EPISODE IN 3 STEPS
+Found by the new divergence guard, which reports the step count it bailed at. Gate
+6 on run 1, ep 15: **504.7 mm -> 7223.9 mm in 3 steps**. dt=1/50, so that is 6.7 m
+in 0.06 s, about 112 m/s.
+
+This is not a direction error -- the failure mode every earlier diagnosis assumed.
+It is an UNBOUNDED magnitude head. `sigma(x) = exp(x-1) if x <= 1 else x`
+(`controller.py:23`) is **linear above 1**, so the regressed magnitude passes
+straight through with no saturation; 112 m/s at d*~0.5 m means the head emitted a
+unit-world magnitude near 224. (An earlier version of this section said the blow-up
+was exponential amplification of the log-norm -- wrong: sigma is exponential only
+BELOW 1, which is the near-goal regime, and there it compresses rather than
+amplifies.) One such step throws the camera clear of the workspace and ends an
+otherwise recoverable episode.
+
+FIXED: `postprocess(..., max_mag=3.0)` clamps the unit-world magnitude before the
+scene scale is reapplied, preserving the DIRECTION (the part the policy is good at,
+per-bin cos 0.77-0.92). 3.0 is far above anything legitimate -- the translation part
+of the label is ~TE/d*, so 3.0 already means "traverse three scene-distances per
+second". Verified: magnitudes up to 2.0 pass through untouched, 5.0 and 8.0 clamp to
+2.16 m/s at d*=0.72. Note it is invisible to `l_dir` (a direction metric) and nearly invisible
+to `l_norm` (a mean over the batch), which is why 40k iterations of offline
+validation never surfaced it.
+
+### 6.22 CORRECTED GATE-6 RESULTS — the runaways were a RENDERER bug, and beta is a null result
+Four runs, all evaluated on the SAME 20 paired scenes and initial poses (server seed
+left at default), row-1 protocol `--deploy hybrid --max-steps 1500 --te-thresh 0.0005
+--re-thresh 0.05`. This supersedes Sec. 6.17 and Sec. 6.18, both of which were
+measured on untextured renders (Sec. 6.19) and are void.
+
+| run | val l_dir | median TE ratio | improved | runaway (>3x) | median final TE | best |
+|---|---|---|---|---|---|---|
+| void: untextured, beta pinned 1.0, hybrid drive | 0.1993 | 0.667 | 11/20 | **9** | 426.0 mm | 38.4 mm |
+| run 1: textured, beta 1.0->0.31, hybrid drive | 0.2261 | 0.407 | 16/20 | 2 | 199.7 mm | 43.1 mm |
+| run 2: beta 0->0.30, PBVS drive, guards, warm start | 0.2065 | **0.172** | **19/20** | **1** | 91.8 mm | 23.0 mm |
+| run 3: beta 0 CONSTANT, PBVS drive, guards, warm start | 0.2108 | 0.200 | 18/20 | 2 | 91.5 mm | **17.4 mm** |
+
+**The bimodal runaway failure was the untextured renderer, not the policy and not the
+control law.** Runaways 9 -> 2 -> 1 -> 2, and 18-19 of 20 episodes now converge partway.
+Sec. 6.18's conclusion ("the policy is unreliable, the deployment law is not the
+culprit") was drawn from two control laws compared over the same broken images and
+does not survive; Sec. 6.17's "closer starts diverge more" inversion goes with it.
+
+**beta is a NULL RESULT.** Runs 2 and 3 differ ONLY in the expert share (same warm
+start from run 1, same PBVS driving, same guards, same shared feature cache), and they
+are indistinguishable: ratio 0.172 vs 0.200, median final TE 91.8 vs 91.5 mm, 19 vs 18
+improved, 1 vs 2 runaways, val l_dir 0.2065 vs 0.2108. Each wins on some measures. At
+n=20 this is noise. Once the renderer is fixed and driving is plain PBVS, the expert
+share between 0% and ~15% average does not measurably matter -- do not spend more time
+tuning beta.
+
+**Attribution caveat.** Runs 2 and 3 were warm-started from run 1, so they carry ~65k
+cumulative iterations against run 1's 32k. Nothing here separates the warm start from
+the other changes, and the run1 -> run2 jump (0.407 -> 0.172) bundles four changes at
+once. The run2/run3 comparison is the only clean single-variable measurement.
+
+**Where the remaining gap is.** SR is still 0/20 because everything stalls in the
+17-92 mm band against a 0.948 mm target -- a precision problem, roughly 20-100x, not a
+stability problem. That is a far better-posed failure than half the episodes flying
+away. The next suspects, in order:
+1. Sec. 6.21's log-space magnitude blow-up (unfixed; a clamp is cheap).
+2. `min_vel` admitting 19% of DAgger pairs on ROTATION alone while its justification
+   is a translation/pixel argument -- it directly shapes near-goal supervision, which
+   is exactly the regime the gate demands. See the discussion above Sec. 6.20.
+3. Near-goal supervision below ~5 mm is now almost absent from the DAgger half:
+   beta=0 rollouts bottom out at a median final TE of 65.9 mm (min 4.9 mm), because
+   with no expert steps nothing drives the camera to 2 mm any more. The uniform half
+   does not cover it either (it is far-heavy). Nothing in the database teaches the
+   last two orders of magnitude.
+4. Sec. 6.3 / the Fig. 2 fine CNN branch -- 16 px patches as the resolution floor.
+
+Item 3 is new and follows directly from fixing beta: a correct DAgger schedule REMOVED
+the near-goal coverage that the broken beta=1.0 was accidentally providing. That is the
+Sec. 6.12 pile-up argument running in reverse, and it may want an explicit near-goal
+sampler rather than relying on either half of the database.
+
+### 6.23 FOUR FIXES FOR THE PRECISION GAP (2026-07-31) — the near-goal band was empty
+Sec. 6.22 left SR 0/20 with everything stalling at 17-92 mm. These four address why
+nothing teaches the last two orders of magnitude. Applied, verified, NOT yet trained.
+
+**1. `min_vel` was gating a quantity with mixed units.** One threshold on
+`||vel_si||` -- a 6-vector combining unit-world translation with radians -- and
+rotation dominates it (median share 0.93). So it did not thin near-goal data
+uniformly; it removed specifically the fine-TRANSLATION pairs:
+
+| of pairs with TE < 20 mm | kept | median RE of kept | median RE of cut |
+|---|---|---|---|
+| old gate (combined >= 0.05) | 19% | 3.72 deg | 0.96 deg |
+
+It kept "still needs rotating" and discarded "aligned but 8 mm off". The cut ended at
+~16 mm; the stall band starts at 17 mm. Now gated PER DOF -- drop only if
+`tv < 0.015 AND rw < 0.012`, each half a 16px patch in its own units. Measured effect:
+admits 64.1% -> 88.2%, min admitted TE 5.0 -> 1.7 mm, sub-20mm pairs 316 -> 1222
+(3.9x), and sub-20mm WELL-ALIGNED pairs **0 -> 8**. The old gate admitted literally
+none of the examples the endgame needs. `--dagger-min-vel` is replaced by
+`--dagger-min-tv` / `--dagger-min-rw`; `stats()` now reports the fine-translation
+share, which is the number the combined gate hid.
+
+**2. There was NO out-of-view check anywhere.** `_gravity_patch` returning None was
+the only signal, and `--drive pbvs` (Sec. 6.23 item below) returns before calling it.
+The TE guard added in Sec. 6.22 cannot substitute, and this is structural, not a
+tuning question: `TE = ||t||` of `inv(tar) @ cur`, so rotating the camera IN PLACE
+leaves TE at exactly 0 while the scene leaves the frame -- measured 0.0 mm TE with
+**0.00 in-frame at 45 deg of yaw**. An episode can sit at TE 50 mm / RE 170 deg
+staring at empty floor and spend its whole budget saving blank images whose pose
+labels are perfectly valid. Added `cns.utils.perception.in_frame_fraction` and a
+`--min-in-frame 0.05` guard to BOTH the collector and the eval, reported as
+`LOST-VIEW`. Note it had not yet bitten: 0% of measured saved states had objects out
+of frame -- but that sample is beta=1.0 expert-driven data, and beta=0 rollouts were
+pruned before they could be checked.
+
+**3. Fixing beta REMOVED the near-goal coverage the bug was supplying.** Expert-driven
+rollouts converge to 2 mm, so beta=1.0 fed the pool a dense near-goal tail by
+accident. With beta working, rollouts bottom out at a measured median 65.9 mm (min
+4.9), only 0-4% of collection episodes ever reach the 2 mm threshold, and the uniform
+half is far-heavy by construction. So NOTHING in the database teaches sub-20mm
+convergence -- the regime the 0.948 mm gate is entirely about. This is Sec. 6.12's
+pile-up argument running in reverse. Fixed by seeding the START pose instead of hoping
+rollouts arrive: `isaac_eval_server.py --near-frac 0.25 --near-te 0.05 --near-re 5`,
+wired into the collection launcher only. **run_isaac_eval.sh deliberately does not set
+it** -- gate 6 must sample the paper's full initial distribution or SR is not
+comparable to Table I. Verified the seeds span TE 5-50 mm (median 16.3), RE 0.5-5 deg.
+
+**4. The magnitude head is unbounded.** See Sec. 6.21, now fixed with
+`postprocess(..., max_mag=3.0)`.
+
+**Also this session:** rollouts are driven by plain PBVS (`--drive pbvs`, default) so
+the unvalidated hybrid Eq. 24 path is off the data-collection path entirely; gate 1
+validates plain PBVS at 100% / 1.97 mm.
+
+**Watch out for item 1 vs Sec. 6.12.** These pull in opposite directions and both are
+right. Sec. 6.12's failure was near-goal DOMINATING the mix (1.8% -> 56.3%), which
+made the closed loop worse. Item 1 admits ~4x more near-goal pairs, so the share must
+be watched: the DAgger half is capped at 35% of each batch and its `near-goal(<0.5)`
+fraction has been running 57-61%, giving an aggregate around 20-25%. If that climbs
+toward 50% the Sec. 6.12 regression is back. `--dagger-frac` and the log-uniform
+subsampling in `_subsample_states` are the two knobs that bound it.
+
+### 6.24 THE CONTROLLER HAS NO POSITIONAL ENCODING — the precision path is architecturally disabled
+Found by auditing against `/home/mowito/Downloads/cnsv2_implementation_spec.md` (2026-07-31).
+Spec Sec. 3.6 specifies the controller's token stack explicitly:
+
+    for 4 blocks: tok = self_attn(tok)     # RoPE
+
+`cns/models/controller.py` has **no positional encoding of any kind** -- no RoPE, no
+learned embedding, nothing. (`refine.py`, the matching transformer, does have RoPE; the
+controller was simply never given one.) `_SelfBlock` is a bare
+`nn.MultiheadAttention`, and the single learned action token then cross-attends and
+collapses 1024 tokens to one vector.
+
+**Consequence, measured on `run2_beta_up_to_03/cnsv2_b0_best.pth`** -- shuffle the
+TOKEN ORDER while keeping feature content, cos(base, shuffled):
+
+| shuffled | cos |
+|---|---|
+| coarse F_c only | +0.999471 |
+| grid P only | +0.998494 |
+| fine CNN only | +0.999285 |
+| **all three, same permutation** | **+1.000000** |
+
+Exactly 1.0 for the joint shuffle is the signature of exact permutation invariance.
+The individual figures fall just short of 1.0 only because shuffling one stream
+misaligns it against the others in the per-token concat before `fuse`.
+
+**Why this matters most for the fine CNN branch.** Position can still reach the
+controller through token CONTENT: RADIO's absolute position embeddings (CPE verified
+True, see backbone.py) travel inside F_c, and Sec. 3.4 notes P's zero pattern encodes
+absolute patch position. The fine CNN has NEITHER -- it is a plain 4-layer stride-2
+conv stack whose only positional signal is where its features sit on the grid, and
+that is exactly what gets discarded. So the branch the paper adds "to capture the
+pixel-wise error to improve the servo precision" (Fig. 2 caption) can contribute only
+a globally pooled "how different are these two images" scalar-ish signal.
+
+That is consistent with its ablation profile: zeroing the branch changes the output by
+55% (so it is NOT dead weight, unlike the P grid in Sec. 6.5) while rearranging it
+changes nothing (cos 0.998-1.000).
+
+**STRONGEST REMAINING HYPOTHESIS for the ~100 mm precision floor**, which survived
+every data-side fix: the precision path is architecturally disabled. Sec. 6.22/6.23
+established the gap is not data-bound -- adding the missing sub-20mm supervision
+(0 -> 8 aligned near-goal pairs, 3.9x more sub-20mm pairs) did not improve closed loop
+and may have hurt it. A position-blind aggregator explains why: no amount of
+fine-grained supervision helps if the head cannot localize it.
+
+**Test:** add RoPE to the controller's self-attention per spec Sec. 3.6, retrain,
+re-run gate 6. Spec Sec. 7 gate 8 frames the with/without-fine-branch TE delta as the
+paper's own missing ablation; do both arms at once and the result covers it.
+
+**Also from the same audit, not yet acted on:**
+- Spec Sec. 3.6 routes `cat([P, F_fine])` ONLY, noting "Eq. 10 writes
+  NeuralController(F_c, S) but Fig. 2 is authoritative". We fuse a THIRD stream,
+  `feat_proj(F_c)`. Since F_c is the only stream carrying real positional content, it
+  may well be dominating -- consistent with the ablation above.
+- Sec. 10.1: the dual-softmax confidence `C` is computed (`dual_softmax_conf`) and
+  thrown away; the spec calls feeding it to the controller "the cheapest likely-
+  positive change; do it in v1 of your build."
+- Sec. 3.4: our Particle2Grid is the literal `scatter_add_` (optimized to 9 anchors
+  from 16), not the separable-convolution form the spec derives. Correct but slow --
+  the spec calls the scatter "unusable at 35 FPS". Fine for training; a deployment
+  blocker.
+- Sec. 11: `test_p2g.py`'s 12 property tests + literal Eq. 16 reference were never
+  ported. There is no test of P at all.
+- Minor: matching transformer runs at full 768 width (spec: project to 256 first);
+  fine CNN is 128 wide (spec 64); controller has 3 self-attn blocks (spec 4); lr 5e-5
+  (spec 1e-4, though 5e-5 is empirically justified here and 1e-4 was never tried).

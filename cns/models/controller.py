@@ -47,15 +47,50 @@ class _CrossAttn(nn.Module):
 
 
 class _SelfBlock(nn.Module):
-    def __init__(self, dim, heads=8):
+    """Self-attention over the fused tokens, WITH 2D axial RoPE.
+
+    It had none. `nn.MultiheadAttention` carries no positional information, and the
+    action token then collapses all N tokens to one vector, so the whole controller
+    was EXACTLY permutation invariant over the grid -- measured on a trained
+    checkpoint: shuffling the token order of all three streams together gave
+    cos(base, shuffled) = 1.000000 (Sec. 6.24).
+
+    That mattered most for the fine CNN branch. Position can still reach the head
+    through token CONTENT -- RADIO's absolute embeddings ride inside F_c, and P's
+    sparsity pattern encodes absolute patch position -- but the fine branch is a plain
+    conv stack whose ONLY positional signal is where its features sit on the grid.
+    So the branch the paper adds "to capture the pixel-wise error to improve the servo
+    precision" had its spatial information discarded by construction, which is the
+    leading explanation for a precision floor that no data-side fix moved.
+
+    Reuses refine.MHAttention rather than a second RoPE implementation; spec Sec. 3.6
+    annotates exactly these blocks with RoPE.
+    """
+
+    def __init__(self, dim, heads=8, use_rope=True):
         super().__init__()
+        self.use_rope = use_rope
         self.n1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        if use_rope:
+            from .refine import MHAttention
+            self.attn = MHAttention(dim, heads, use_rope=True)
+        else:
+            # Deliberately the ORIGINAL nn.MultiheadAttention, not MHAttention with
+            # use_rope=False. The two have different parameter names (in_proj/out_proj
+            # vs q/k/v/proj), so routing the no-RoPE path through MHAttention would
+            # make every pre-existing checkpoint unloadable. Keeping this branch byte-
+            # compatible means ctrl_rope=False genuinely reproduces the old model and
+            # the earlier runs stay evaluable.
+            self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
         self.n2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
 
-    def forward(self, x):
-        y = self.n1(x); x = x + self.attn(y, y, y, need_weights=False)[0]
+    def forward(self, x, hw):
+        y = self.n1(x)
+        if self.use_rope:
+            x = x + self.attn(y, y, hw, hw)
+        else:
+            x = x + self.attn(y, y, y, need_weights=False)[0]
         x = x + self.ffn(self.n2(x))
         return x
 
@@ -63,7 +98,7 @@ class _SelfBlock(nn.Module):
 class NeuralController(nn.Module):
     def __init__(self, feat_dim: int, grid_dim: int, dim: int = 256,
                  n_self: int = 3, heads: int = 8, regress_norm: bool = True,
-                 fine_dim: int = 0):
+                 fine_dim: int = 0, ctrl_rope: bool = True):
         super().__init__()
         self.regress_norm = regress_norm
         self.fine_dim = fine_dim
@@ -87,7 +122,9 @@ class NeuralController(nn.Module):
             self.fine_norm = nn.LayerNorm(fine_dim)
             self.fine_proj = nn.Linear(fine_dim, dim)
         self.fuse = nn.Linear(n_stream * dim, dim)
-        self.self_blocks = nn.ModuleList([_SelfBlock(dim, heads) for _ in range(n_self)])
+        self.ctrl_rope = ctrl_rope
+        self.self_blocks = nn.ModuleList(
+            [_SelfBlock(dim, heads, use_rope=ctrl_rope) for _ in range(n_self)])
         # learned action token cross-attends into the fused tokens (grid-conditioned)
         self.action_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.cross = _CrossAttn(dim, heads)
@@ -112,7 +149,7 @@ class NeuralController(nn.Module):
             streams.append(self.fine_proj(self.fine_norm(fine.reshape(B, H * W, -1))))
         tok = self.fuse(torch.cat(streams, dim=-1))         # [B,N,dim]
         for blk in self.self_blocks:
-            tok = blk(tok)
+            tok = blk(tok, (H, W))          # RoPE needs the grid shape
         act = self.action_token.expand(B, 1, -1)
         act = act + self.cross(act, tok)                   # cross-attend into grid-conditioned tokens
         act = self.cross_norm(act).squeeze(1)              # [B,dim]
@@ -123,12 +160,31 @@ class NeuralController(nn.Module):
 
     # ---- CNS-v1 trainer contract -------------------------------------------
     @staticmethod
-    def postprocess(raw_pred, tPo_norm):
+    def postprocess(raw_pred, tPo_norm, max_mag=3.0):
         """(vec, log_norm) -> real-world-scaled velocity [B,6] (Eq. 22 + depth
-        re-scale of translation). tPo_norm: [B] or [B,1] scene scale s=d*."""
+        re-scale of translation). tPo_norm: [B] or [B,1] scene scale s=d*.
+
+        max_mag clamps the UNIT-WORLD magnitude before the scale is reapplied.
+        `sigma(x) = exp(x-1) if x <= 1 else x` is LINEAR above 1, so the head's
+        magnitude output passes through unbounded -- there is no saturation to lean
+        on. One outlier prediction becomes an enormous metric velocity. Measured in
+        gate 6:
+        504.7 mm -> 7223.9 mm in THREE steps at dt=1/50, i.e. ~112 m/s, which threw
+        the camera clear of the workspace and ended an otherwise recoverable episode
+        (Sec. 6.21). A single blown step is unrecoverable because there is no
+        velocity limit anywhere else in the loop.
+
+        3.0 is well above anything legitimate: the label ||vel_si|| is ~TE/d* for
+        the translation part, so a unit-world magnitude of 3 already means "move
+        three times the scene distance in one second". Clamping the magnitude
+        preserves the DIRECTION, which is the part the policy is good at
+        (per-bin cos 0.77-0.92). Set max_mag=0 to disable.
+        """
         vec, log_norm, _ = raw_pred
         direction = vec / (vec.norm(dim=-1, keepdim=True) + 1e-8)
         mag = sigma(log_norm) if log_norm is not None else vec.norm(dim=-1, keepdim=True)
+        if max_mag and max_mag > 0:
+            mag = mag.clamp(max=max_mag)
         v = direction * mag                                # normalized (unit-world) velocity
         s = tPo_norm.view(-1, 1)
         v = v.clone()

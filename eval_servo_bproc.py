@@ -23,8 +23,9 @@ import torch
 from cns.models.cnsv2_net import build_model, build_from_checkpoint
 from cns.models.controller import sigma
 from cns.models.denorm import pbvs_inverse
-from cns.models.hybrid_control import hybrid_velocity_eq24, should_use_hybrid
+from cns.models.hybrid_control import hybrid_velocity_eq24, should_use_hybrid, LAM
 from eval_servo import pose_error, integrate      # identical metrics + integrator
+from cns.utils.perception import in_frame_fraction
 
 
 def wait_for(path, timeout, what, poll=0.002):
@@ -61,6 +62,19 @@ def main():
     ap.add_argument("--deploy", default="hybrid", choices=["hybrid", "pbvs"],
                     help="hybrid = Table I row 1 (Sec. G switch, the paper's "
                          "deployment); pbvs = row 7 ablation (raw policy always)")
+    # Divergence bail-out, matching collect_dagger.py's defaults so a lost episode
+    # means the same thing on both sides.
+    ap.add_argument("--max-te-ratio", type=float, default=3.0,
+                    help="abandon the episode once TE exceeds this multiple of the "
+                         "initial TE. 0 disables (the old unbounded behaviour).")
+    ap.add_argument("--max-te", type=float, default=2.0,
+                    help="absolute TE bound in metres, alongside --max-te-ratio. "
+                         "0 disables.")
+    ap.add_argument("--min-in-frame", type=float, default=0.05,
+                    help="abandon the episode when fewer than this fraction of "
+                         "object points project inside the image. Orthogonal to the "
+                         "TE bound: rotating in place leaves TE at 0 while the scene "
+                         "leaves the frame. 0 disables.")
     ap.add_argument("--timeout", type=float, default=600.0)
     args = ap.parse_args()
     W = args.workdir
@@ -116,7 +130,7 @@ def main():
                 # in the unit world (Z~_d = 1) so the real scene scale s applies.
                 t_c = -(R_dc.T @ t_dc) * s
                 return hybrid_velocity_eq24(t_c, th_u, cXg, dXg,
-                                            Z=s, lam=1.0), "hyb"
+                                            Z=s, lam=LAM), "hyb"
 
         return (net.postprocess(raw, torch.tensor([s], device=dev))[0].cpu().numpy(),
                 "pbvs")
@@ -138,6 +152,8 @@ def main():
         te0, re0 = pose_error(cur, tar)
         traj = [(te0, re0)]
         n_hyb = 0
+        diverged = False
+        lost_view = False
         for k in range(args.max_steps):
             if args.oracle:
                 from cns.sim.supervisor import pbvs_straight
@@ -170,6 +186,22 @@ def main():
             traj.append(pose_error(cur, tar))
             if traj[-1][0] < args.te_thresh and traj[-1][1] < args.re_thresh:
                 break                                    # converged, stop early
+            # Divergence bail-out, same rule as collect_dagger.py so collection and
+            # evaluation agree on what counts as a lost episode. There is no velocity
+            # clamp and no workspace bound, so without this a runaway integrates for
+            # the full 30 s: measured finals of 37 m and 53 m, which is just how far
+            # it flew before the step budget ended. Those magnitudes carry no
+            # information -- only "diverged" does -- and each one burned 1500 renders
+            # (~2.5 min) travelling away from the goal.
+            lim = max(args.max_te_ratio * te0 if args.max_te_ratio > 0 else 0.0,
+                      args.max_te if args.max_te > 0 else 0.0)
+            if lim > 0 and traj[-1][0] > lim:
+                diverged = True
+                break
+            if args.min_in_frame > 0 and \
+                    in_frame_fraction(cur, wP) < args.min_in_frame:
+                lost_view = True
+                break
         with open(os.path.join(W, f"ep{ep}_end"), "w") as f:
             f.write("1")
 
@@ -178,7 +210,9 @@ def main():
         rows.append((te0, re0, teN, reN, float(ok)))
         print(f"ep {ep:2d}: te {te0*1000:7.1f}->{teN*1000:7.1f} mm | "
               f"re {re0:6.1f}->{reN:6.1f} deg | {len(traj)-1:4d} steps | "
-              f"hyb {n_hyb:4d} | {'OK' if ok else '--'}", flush=True)
+              f"hyb {n_hyb:4d} | "
+              f"{'OK' if ok else ('DIVERGED' if diverged else ('LOST-VIEW' if lost_view else '--'))}",
+              flush=True)
 
     rows = np.asarray(rows, float)
     sr = rows[:, 4].mean()

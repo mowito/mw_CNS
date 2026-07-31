@@ -27,7 +27,7 @@ class CNSv2Net(nn.Module):
                  refine_heads: int = 8, ctrl_dim: int = 256, ctrl_self: int = 3,
                  backbone_version: str = "radio_v2.5-b", freeze_backbone: bool = True,
                  regress_norm: bool = True, load_backbone: bool = True,
-                 fine_dim: int = 128):
+                 fine_dim: int = 128, ctrl_rope: bool = True):
         super().__init__()
         self.K = K
         self.feat_dim = feat_dim
@@ -40,7 +40,7 @@ class CNSv2Net(nn.Module):
         self.fine = FineCNN(out_dim=fine_dim) if fine_dim else None
         self.controller = NeuralController(
             feat_dim=feat_dim, grid_dim=K * K, dim=ctrl_dim, n_self=ctrl_self,
-            regress_norm=regress_norm, fine_dim=fine_dim)
+            regress_norm=regress_norm, fine_dim=fine_dim, ctrl_rope=ctrl_rope)
 
     def features(self, Ic, Id):
         """Run frozen backbone -> refined features (allows caching desired-image feats)."""
@@ -149,11 +149,20 @@ def build_from_checkpoint(ck, device="cuda", **overrides) -> CNSv2Net:
         (int(k.split(".")[2]) for k in sd if k.startswith("refine.blocks.")),
         default=kw["refine_layers"] - 1)
 
+    # ctrl_rope: read from the state dict, never assumed. The controller's self-attn
+    # switched from nn.MultiheadAttention (no positional encoding, so exactly
+    # permutation invariant -- Sec. 6.24) to refine.MHAttention with 2D axial RoPE.
+    # The two have different parameter names, so guessing wrong is a load failure at
+    # best and a silently different model at worst.
+    kw["ctrl_rope"] = any(k.startswith("controller.self_blocks.0.attn.q.")
+                          for k in sd)
+
     kw.update(overrides)
     net = CNSv2Net(**kw).to(device)
     net.load_state_dict(sd)
     print(f"[model] built from checkpoint: K={kw['K']} ctrl_dim={kw['ctrl_dim']} "
-          f"refine_layers={kw['refine_layers']} fine_dim={kw['fine_dim']}"
+          f"refine_layers={kw['refine_layers']} fine_dim={kw['fine_dim']} "
+          f"ctrl_rope={kw['ctrl_rope']}"
           + ("  (NO fine CNN branch -- coarse-only ablation)" if not kw["fine_dim"] else ""),
           flush=True)
     return net

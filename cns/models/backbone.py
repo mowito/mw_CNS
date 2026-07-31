@@ -27,6 +27,25 @@ class RadioBackbone(nn.Module):
             "NVlabs/RADIO", "radio_model", version=version,
             progress=True, skip_validation=True, trust_repo=True,
         )
+        # Cropped Position Embedding is what makes RADIO's ABSOLUTE positional
+        # embeddings resolution-robust, and enable_cpe() is a monkey-patch applied on
+        # top of a stock timm ViT. Load by any route that skips it and you silently
+        # get the backbone WITHOUT CPE -- no error, no warning, just worse features at
+        # any resolution other than the one it was pretrained at. Verified True for
+        # the torch.hub route above; asserted so a loader change cannot regress it
+        # unnoticed. Nested two levels: RADIOModel.model is the timm ViT.
+        pg = getattr(getattr(self.model, "model", None), "patch_generator", None)
+        if pg is None:
+            print("[backbone] WARNING: no patch_generator found; cannot verify "
+                  "cpe_mode. If RADIO's internals moved, re-check that Cropped "
+                  "Position Embedding is active.", flush=True)
+        elif not getattr(pg, "cpe_mode", False):
+            raise SystemExit(
+                "[backbone] REFUSING to run: patch_generator.cpe_mode is False, so "
+                "this RADIO was loaded WITHOUT Cropped Position Embedding. Absolute "
+                "position embeddings are then not resolution-robust and every "
+                "feature downstream is degraded silently.")
+
         self.freeze = freeze
         if freeze:
             self.model.eval()

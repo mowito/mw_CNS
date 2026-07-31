@@ -81,7 +81,7 @@ def main():
         # first at 5 scenes, so eviction is driven by pair pressure, as in the
         # real run (8000 pairs vs 1600 scene slots).
         pool = dp.DaggerPool(cache, H16, W16, C, H1=H1, W1=W1,
-                             reserve_pairs=20, reserve_scenes=6, min_vel=0.05)
+                             reserve_pairs=20, reserve_scenes=6, min_tv=0.015, min_rw=0.012)
         check(pool, "empty")
         assert pool.n_pairs == 0
 
@@ -119,7 +119,7 @@ def main():
         want = (pool.n_pairs, pool.n_scenes, pool.pair_valid.clone(),
                 pool.scene_seq.clone(), pool.seq)
         again = dp.DaggerPool(cache, H16, W16, C, H1=H1, W1=W1,
-                             reserve_pairs=20, reserve_scenes=6, min_vel=0.05)
+                             reserve_pairs=20, reserve_scenes=6, min_tv=0.015, min_rw=0.012)
         assert (again.n_pairs, again.n_scenes) == want[:2], "counts lost on reload"
         assert bool((again.pair_valid == want[2]).all()), "pair mask lost on reload"
         assert bool((again.scene_seq == want[3]).all()), "scene order lost on reload"

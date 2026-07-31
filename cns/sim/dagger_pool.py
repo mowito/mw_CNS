@@ -65,8 +65,33 @@ from cns.sim.supervisor import supervisor_vel, Policy
 class DaggerPool:
     def __init__(self, cache_dir, H16, W16, C, H1=512, W1=512,
                  reserve_pairs=20000, reserve_scenes=4000, intrinsic=None,
-                 min_vel=0.05):
-        """min_vel: reject pairs whose ||vel_si|| is below this.
+                 min_tv=0.015, min_rw=0.012):
+        """Reject a pair only when BOTH its translation and its rotation are below
+        the resolvable floor. Thresholds are per-DOF, in the units each actually has.
+
+        The previous gate was a single threshold on ||vel_si||, the mixed 6-vector.
+        Rotation dominates that norm (measured median share 0.93), so the gate did
+        NOT thin near-goal data uniformly -- it removed specifically the
+        fine-TRANSLATION pairs. Measured over saved rollouts, of the pairs with
+        TE < 20 mm it kept 19% and cut 81%, and the survivors had median RE 3.72 deg
+        against the rejected pairs' 0.96 deg. In other words it kept "still needs
+        rotating" and discarded "aligned but 8 mm off" -- which is exactly the skill
+        needed to close from the measured 17-92 mm closed-loop stall to Table I's
+        0.948 mm. The cut ended at ~16 mm and the stall band starts at 17 mm; those
+        two numbers meeting was not a coincidence (Sec. 6.22).
+
+        Defaults are half a 16px patch in each DOF. At the canonical intrinsics the
+        image spans ~d* metres at distance d*, so one patch is d*/32, i.e. 1/32 in
+        unit-world -> half a patch = 0.015. For rotation, a yaw of theta moves a
+        mid-frame point by ~theta*1.25*f px, so one patch is ~0.025 rad -> half is
+        0.012. Sec. 6.3's "drop what one 16px patch cannot resolve" is preserved
+        per-DOF instead of being applied to a quantity with mixed units.
+
+        NOTE this deliberately admits more near-goal data than before. Sec. 6.12's
+        finding was that near-goal pile-up DOMINATING the mix hurt (1.8% -> 56%
+        near-goal drove the closed loop worse), not that near-goal data is bad. The
+        log-uniform subsampling in collect_dagger.py is what bounds the share; this
+        gate only removes what is physically unresolvable.
 
         Belt-and-braces against the geometric pile-up described above. The
         collector already log-subsamples its states, but this pool is fed by
@@ -76,7 +101,8 @@ class DaggerPool:
         """
         from cns.utils.perception import CameraIntrinsic
         self.dir = cache_dir
-        self.min_vel = float(min_vel)
+        self.min_tv = float(min_tv)
+        self.min_rw = float(min_rw)
         self.n_rejected = 0
         self.intr = intrinsic or CameraIntrinsic(W1, H1, 512, 512, W1 // 2, H1 // 2)
         os.makedirs(cache_dir, exist_ok=True)
@@ -247,7 +273,9 @@ class DaggerPool:
                     _, (tpo, vsi) = supervisor_vel(
                         policy, dummy, dz, dummy, dz, self.intr,
                         poses[sl.start + j], poses[0], wP)
-                    if float(np.linalg.norm(vsi)) < self.min_vel:
+                    tv = float(np.linalg.norm(vsi[:3]))
+                    rw = float(np.linalg.norm(vsi[3:]))
+                    if tv < self.min_tv and rw < self.min_rw:
                         self.n_rejected += 1
                         continue
                     if not free:
@@ -283,9 +311,14 @@ class DaggerPool:
     def stats(self):
         if self.n_pairs == 0:
             return "empty"
-        n = self.vsi[self._valid_rows()].norm(dim=-1)
+        v = self.vsi[self._valid_rows()]
+        n = v.norm(dim=-1)
+        tv = v[:, :3].norm(dim=-1)
         return (f"{self.n_pairs} pairs / {self.n_scenes} scenes, "
                 f"||vel_si|| min {n.min():.3f} median {n.median():.3f}, "
                 f"near-goal(<0.5) {100 * (n < 0.5).float().mean():.1f}%, "
-                f"rejected<{self.min_vel} {self.n_rejected}, "
+                # Translation-only share of the near band is the number the old
+                # combined gate hid; watch it rather than ||vel_si||.
+                f"fine-trans(tv<0.05) {100 * (tv < 0.05).float().mean():.1f}%, "
+                f"rejected(tv<{self.min_tv} AND rw<{self.min_rw}) {self.n_rejected}, "
                 f"evicted {self.n_evicted} scenes")
