@@ -20,7 +20,8 @@ class Dataset(object):
         train=True, 
         env="Point", 
         aug=ObsAug.Default,
-        supervisor=Policy.PBVS_Center_Straight 
+        supervisor=Policy.PBVS_Center_Straight,
+        lambda_0=10.0, lambda_inf=4.0, m=30.0
     ):
         super().__init__()
 
@@ -33,7 +34,13 @@ class Dataset(object):
         }
         self.env: PointEnv = env_map[env](camera_config, resample=train, auto_reinit=False)
         self.supervisor = supervisor
-        
+        # PBVS supervisor's per-component adaptive gain (see
+        # cns/sim/supervisor.py:adaptive_gain) -- lambda_0=lambda_inf=1
+        # recovers the original fixed-gain-1 law.
+        self.lambda_0 = lambda_0
+        self.lambda_inf = lambda_inf
+        self.m = m
+
         self.gt_vel = np.zeros(6)
         self.train = train
         self.aug = aug  # Note: augmentations are effective only when `train`=True
@@ -134,9 +141,10 @@ class Dataset(object):
 
         # get supervisor's velocity
         vel, (tPo_norm, vel_si) = supervisor_vel(
-            self.supervisor, 
-            current_xy, current_Z, target_xy, target_Z, intrinsic, 
-            current_wcT, target_wcT, pbvs_points)
+            self.supervisor,
+            current_xy, current_Z, target_xy, target_Z, intrinsic,
+            current_wcT, target_wcT, pbvs_points,
+            lambda_0=self.lambda_0, lambda_inf=self.lambda_inf, m=self.m)
         self.gt_vel = vel.copy()
 
         # append extra data for training
@@ -174,14 +182,18 @@ class Dataset(object):
 
 
 class DataLoader(object):
-    def __init__(self, camera_config, batch_size, train=True, num_trajs=1000, env="Point"):
+    def __init__(self, camera_config, batch_size, train=True, num_trajs=1000, env="Point",
+                 lambda_0=10.0, lambda_inf=4.0, m=30.0):
         self.batch_size = batch_size
         if not train:
             np.random.seed(2022)
         self.datasets: List[Dataset] = [
-            Dataset(camera_config, train, env="Point") for _ in range(batch_size - 1)]
+            Dataset(camera_config, train, env="Point",
+                    lambda_0=lambda_0, lambda_inf=lambda_inf, m=m)
+            for _ in range(batch_size - 1)]
         # only the last dataset can be set to PointGUI or ImageGUI
-        self.datasets.append(Dataset(camera_config, train, env=env, aug=ObsAug.Default))
+        self.datasets.append(Dataset(camera_config, train, env=env, aug=ObsAug.Default,
+                                      lambda_0=lambda_0, lambda_inf=lambda_inf, m=m))
         
         self.num_batches = int(float(num_trajs) / batch_size)
         self.num_batches = max(self.num_batches, 1)

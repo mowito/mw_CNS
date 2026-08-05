@@ -28,6 +28,20 @@ def parse_args():
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--long", action="store_true")
     parser.add_argument("--gui", action="store_true")
+    # PBVS supervisor's per-component adaptive gain (see
+    # cns/sim/supervisor.py:adaptive_gain, ported from
+    # statemachine_utils/visual_servoing_utils.hpp's adaptive_gain()).
+    # lambda_0=lambda_inf recovers the original fixed-gain law.
+    parser.add_argument("--pbvs-lambda0", type=float, default=10.0,
+                         help="Adaptive gain at zero error (near target).")
+    parser.add_argument("--pbvs-lambda-inf", type=float, default=4.0,
+                         help="Adaptive gain at large error (far from target).")
+    parser.add_argument("--pbvs-m", type=float, default=30.0,
+                         help="Adaptive gain transition slope.")
+    parser.add_argument("--num-trajs-train", type=int, default=640,
+                         help="Trajectories for the training loader (was hardcoded to 640).")
+    parser.add_argument("--num-trajs-valid", type=int, default=64,
+                         help="Trajectories for the validation loader (was hardcoded to 64).")
     return parser.parse_args()
 
 
@@ -47,8 +61,14 @@ def train(args):
     if args.gui:
         p.connect(p.GUI_SERVER)
 
-    train_loader = data_class(None, args.batch_size, train=True, num_trajs=640, env=env)
-    valid_loader = data_class(None, 64, train=False, num_trajs=64, env=env)
+    pbvs_gain_kwargs = dict(
+        lambda_0=args.pbvs_lambda0, lambda_inf=args.pbvs_lambda_inf, m=args.pbvs_m)
+    train_loader = data_class(
+        None, args.batch_size, train=True, num_trajs=args.num_trajs_train, env=env,
+        **pbvs_gain_kwargs)
+    valid_loader = data_class(
+        None, 64, train=False, num_trajs=args.num_trajs_valid, env=env,
+        **pbvs_gain_kwargs)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print("[INFO] Run on device: {}".format(device))
@@ -60,7 +80,15 @@ def train(args):
             regress_norm=True
         ).to(device)
     else:
-        model = torch.load(args.load, map_location=device)["net"]
+        # PyTorch >=2.6 defaults torch.load to weights_only=True, which
+        # refuses to unpickle the checkpoint's full GraphVS object (not just
+        # a state dict) -- and the pickle graph likely nests more than just
+        # GraphVS (torch_geometric layers, etc.), so allowlisting one class
+        # at a time via add_safe_globals would mean discovering each one via
+        # a fresh crash. weights_only=False is safe here: this checkpoint is
+        # self-produced by this same train_cns.py run, not from an untrusted
+        # source.
+        model = torch.load(args.load, map_location=device, weights_only=False)["net"]
 
     pg_wi_decay, pg_wo_decay = model.get_parameter_groups()
     optimizers = {

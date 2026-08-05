@@ -4,6 +4,27 @@ from cns.utils.perception import CameraIntrinsic
 from scipy.spatial.transform import Rotation as R
 
 
+def adaptive_gain(error, lambda_0, lambda_inf, m):
+    """Chaumette/Malis adaptive gain, ported from
+    statemachine_utils/visual_servoing_utils.hpp's adaptive_gain(): gain is
+    lambda_0 at zero error and decays to lambda_inf as |error| grows, with m
+    controlling the transition slope. Caps commanded velocity for large
+    errors (avoids saturating/overshooting when far from target) while
+    keeping a strong gain for fast final convergence near it.
+
+    error may be a scalar or array -- np.exp/np.abs broadcast elementwise,
+    so passing e.g. a 3-vector of per-axis translation errors returns a
+    3-vector of per-axis gains (matches generate_velocities_pbvs.hpp's own
+    per-component gain_x/gain_y/gain_z... usage).
+    """
+    if lambda_0 == lambda_inf:
+        # divides by (lambda_0 - lambda_inf) below -- guard the degenerate
+        # "constant gain" case explicitly rather than relying on 0*exp(-inf)
+        # happening to cancel out (it doesn't if error==0 exactly: 0/0 -> nan).
+        return np.full_like(np.asarray(error, dtype=float), lambda_0)
+    return (lambda_0 - lambda_inf) * np.exp(-np.abs(error) * m / (lambda_0 - lambda_inf)) + lambda_inf
+
+
 def ibvs(
     fp_cur: np.ndarray,
     Z_cur: np.ndarray,
@@ -66,9 +87,14 @@ def ibvs(
     return vel
 
 
-def pbvs_center(cur_wcT, tar_wcT, wP):
-    """PBVS: ensure the projection of scene center is always at 
+def pbvs_center(cur_wcT, tar_wcT, wP, lambda_0=10.0, lambda_inf=4.0, m=30.0):
+    """PBVS: ensure the projection of scene center is always at
     center of camera's FoV
+
+    Translation and rotation error each get their own per-component
+    adaptive gain (see adaptive_gain()) instead of the fixed gain=1 this
+    used to apply implicitly -- lambda_0=lambda_inf=1 recovers the exact
+    original law.
     """
     wPo = np.mean(wP, axis=0)  # w: world frame, o: center, P: points
 
@@ -82,20 +108,28 @@ def pbvs_center(cur_wcT, tar_wcT, wP):
     tcT = tar_cwT @ cur_wcT
     u = R.from_matrix(tcT[:3, :3]).as_rotvec()
 
-    v = -(tPo - cPo + np.cross(cPo, u))
-    w = -u
+    e_t = tPo - cPo + np.cross(cPo, u)
+    e_r = u
+    v = -adaptive_gain(e_t, lambda_0, lambda_inf, m) * e_t
+    w = -adaptive_gain(e_r, lambda_0, lambda_inf, m) * e_r
     vel = np.concatenate([v, w])
 
     return vel
 
 
-def pbvs_straight(cur_wcT, tar_wcT):
-    """PBVS2: goes straight and shortest path"""
+def pbvs_straight(cur_wcT, tar_wcT, lambda_0=10.0, lambda_inf=4.0, m=30.0):
+    """PBVS2: goes straight and shortest path
+
+    Same per-component adaptive gain as pbvs_center (see adaptive_gain());
+    lambda_0=lambda_inf=1 recovers the exact original fixed-gain-1 law.
+    """
     tcT = np.linalg.inv(tar_wcT) @ cur_wcT
     u = R.from_matrix(tcT[:3, :3]).as_rotvec()
 
-    v = -tcT[:3, :3].T @ tcT[:3, 3]
-    w = -u
+    e_t = tcT[:3, :3].T @ tcT[:3, 3]
+    e_r = u
+    v = -adaptive_gain(e_t, lambda_0, lambda_inf, m) * e_t
+    w = -adaptive_gain(e_r, lambda_0, lambda_inf, m) * e_r
     vel = np.concatenate([v, w])
 
     return vel
@@ -248,7 +282,11 @@ def _logistic(x, a=1):
     return 1.0 / (1 + np.exp(-x*a))
 
 
-def pbvs_hybrid(cur_wcT, tar_wcT, wP):
+def pbvs_hybrid(cur_wcT, tar_wcT, wP, lambda_0=10.0, lambda_inf=4.0, m=30.0):
+    """Blends _pbvs_mine (untouched -- a custom look-at-center heuristic,
+    not a plain PBVS law, out of scope for the adaptive-gain change) with
+    pbvs_straight, which does get the same adaptive gain as elsewhere here.
+    """
     wPo = np.mean(wP, axis=0)
     u = np.linalg.inv(cur_wcT[:3, :3]) @ tar_wcT[:3, :3]
     u = R.from_matrix(u).as_rotvec()
@@ -256,7 +294,7 @@ def pbvs_hybrid(cur_wcT, tar_wcT, wP):
     alpha = _logistic(uz_deg - 30, 0.4)
 
     control = alpha * _pbvs_mine(cur_wcT, tar_wcT, wPo) + \
-        (1 - alpha) * pbvs_straight(cur_wcT, tar_wcT)
+        (1 - alpha) * pbvs_straight(cur_wcT, tar_wcT, lambda_0, lambda_inf, m)
     return control
 
 
@@ -270,16 +308,17 @@ class Policy(Enum):
 def supervisor_vel(
     policy: Policy,
     cur_fp, cur_Z, tar_fp, tar_Z, intrinsic: CameraIntrinsic,
-    cur_wcT, tar_wcT, wP, *args, **kwargs
+    cur_wcT, tar_wcT, wP, *args,
+    lambda_0=10.0, lambda_inf=4.0, m=30.0, **kwargs
 ):
     if policy == Policy.IBVS:
         vel = ibvs(cur_fp, cur_Z, tar_fp, tar_Z, intrinsic)
     elif policy == Policy.PBVS_Center:
-        vel = pbvs_center(cur_wcT, tar_wcT, wP)
+        vel = pbvs_center(cur_wcT, tar_wcT, wP, lambda_0, lambda_inf, m)
     elif policy == Policy.PBVS_Straight:
-        vel = pbvs_straight(cur_wcT, tar_wcT)
+        vel = pbvs_straight(cur_wcT, tar_wcT, lambda_0, lambda_inf, m)
     elif policy == Policy.PBVS_Center_Straight:
-        vel = pbvs_hybrid(cur_wcT, tar_wcT, wP)
+        vel = pbvs_hybrid(cur_wcT, tar_wcT, wP, lambda_0, lambda_inf, m)
     else:
         raise ValueError("Unknown Policy")
 
