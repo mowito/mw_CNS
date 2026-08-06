@@ -140,6 +140,10 @@ class SSIMStopPolicy(ErrorHoldingStopPolicy):
         if cur_img.ndim == 3: cur_img = rgb2gray(cur_img)
         if tar_img.ndim == 3: tar_img = rgb2gray(tar_img)
 
-        ssim = structural_similarity(tar_img, cur_img)
+        # newer scikit-image requires an explicit data_range for floating
+        # point images instead of inferring it -- derive it from the actual
+        # data rather than assuming a fixed [0,1] or [0,255] convention.
+        data_range = max(cur_img.max(), tar_img.max()) - min(cur_img.min(), tar_img.min())
+        ssim = structural_similarity(tar_img, cur_img, data_range=data_range)
         error = 1 - ssim
         return error

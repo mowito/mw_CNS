@@ -11,8 +11,20 @@ class GraphVSController(object):
     def __init__(self, ckpt_path: str, device="cuda:0"):
         self.device = torch.device(device)
         # self.net: GraphVS = torch.load(ckpt_path, map_location=self.device)["net"]
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        if hasattr(ckpt, "net") and isinstance(ckpt["net"], torch.nn.Module):
+        # weights_only=False: PyTorch >=2.6 defaults torch.load to
+        # weights_only=True, which refuses to unpickle a full {"net": GraphVS}
+        # checkpoint (see train_cns.py for the same fix/rationale). Safe for
+        # our own checkpoints; ckpt_path here is always a trusted local file.
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        # ckpt is a plain dict -- hasattr(ckpt, "net") checks for an
+        # attribute, which a dict never has (only keys), so it was always
+        # False and always fell through to the raw-state_dict branch. That
+        # happened to be correct for cns_state_dict.pth (genuinely a raw
+        # state_dict) but silently mishandles a full Trainer checkpoint
+        # dict ({"epoch", "net", "optimizers", ...}, e.g. train_cns.py's
+        # own checkpoint_best.pth) by trying to load the whole dict as if
+        # its keys were parameter names.
+        if "net" in ckpt and isinstance(ckpt["net"], torch.nn.Module):
             self.net: GraphVS = ckpt["net"]
         else:
             self.net = GraphVS(2, 2, 128, regress_norm=True).to(device)

@@ -128,8 +128,14 @@ class ImageEnv(object):
         )
         image_pts_query = self.camera.project(np.linalg.inv(wcT), space_pts_load)
 
-        points_src = torch.from_numpy(image_pts_load).float().view(1, 4, 2)  # (1, 4, 2)
-        points_dst = torch.from_numpy(image_pts_query).float().view(1, 4, 2)
+        # .contiguous(): image_pts_query from self.camera.project(...) isn't
+        # guaranteed contiguous, and kornia's get_perspective_transform calls
+        # .view() internally on whatever we hand it -- .view() requires
+        # contiguity, and .reshape() alone only copies when the shape change
+        # itself demands it, not just to fix up strides, so it isn't a
+        # reliable guarantee here.
+        points_src = torch.from_numpy(image_pts_load).float().reshape(1, 4, 2).contiguous()  # (1, 4, 2)
+        points_dst = torch.from_numpy(image_pts_query).float().reshape(1, 4, 2).contiguous()
         M = K.geometry.get_perspective_transform(points_src, points_dst).to(self.device)
         image_query = K.geometry.warp_perspective(image_load, M, dsize=(H, W))
 

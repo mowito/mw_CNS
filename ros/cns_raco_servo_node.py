@@ -190,11 +190,16 @@ class CnsRacoServoNode(Node):
         self.declare_parameter("cmd_vel_topic", "cam_vel")
         self.declare_parameter("camera_frame", "camera_color_optical_frame")
         self.declare_parameter("keypoint_error_topic", "keypoint_error")
-        # cns_state_dict.pth (not cns.pth) -- torch >= 2.6 defaults
-        # torch.load to weights_only=True, which rejects cns.pth's pickled
-        # GraphVS class reference; the plain state dict loads cleanly.
+        # Best checkpoint from the 08_05_01_05_27_CNS_adaptive_gain_long
+        # training run -- GraphVS trained against the adaptive-gain PBVS
+        # supervisor (cns/sim/supervisor.py:pbvs) instead of the original
+        # fixed-gain targets. GraphVSController loads this full Trainer
+        # checkpoint dict ({"net": GraphVS, ...}) directly, no state-dict
+        # extraction needed.
         self.declare_parameter(
-            "checkpoint_path", str(_MW_CNS_ROOT / "checkpoints" / "cns_state_dict.pth"))
+            "checkpoint_path", str(
+                _MW_CNS_ROOT / "checkpoints" / "08_05_01_05_27_CNS_adaptive_gain_long"
+                / "checkpoint_best.pth"))
         self.declare_parameter("device", "cuda:0" if torch.cuda.is_available() else "cpu")
         # Distance (metres) from the camera to the scene centre at the
         # target pose -- CNS's `tPo_norm` scale factor, which directly
